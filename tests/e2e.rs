@@ -670,6 +670,7 @@ fn reduced_frames_incompatible_endpoint_checksum_noop_and_warning_exit() {
         identical_remote.path().join("same"),
     )
     .unwrap();
+    fs::write(identical_local.path().join("different"), b"transfer me").unwrap();
     let metadata = fs::metadata(identical_local.path().join("same")).unwrap();
     set_file_mtime(
         identical_remote.path().join("same"),
@@ -685,6 +686,9 @@ fn reduced_frames_incompatible_endpoint_checksum_noop_and_warning_exit() {
     ]);
     assert!(identical.status.success(), "{identical:?}");
     let events = json_stderr(&identical);
+    assert!(events.iter().any(|event| {
+        event["event"] == "entry_start" && event["kind"] == "file" && event["path"] == "different"
+    }));
     assert!(!events.iter().any(|event| {
         event["event"] == "entry_start" && event["kind"] == "file" && event["path"] == "same"
     }));
@@ -692,8 +696,10 @@ fn reduced_frames_incompatible_endpoint_checksum_noop_and_warning_exit() {
     let warning_local = tempdir().unwrap();
     let warning_remote = tempdir().unwrap();
     let special_path = warning_local.path().join("special-mode");
-    fs::write(&special_path, b"warning").unwrap();
-    fs::set_permissions(&special_path, fs::Permissions::from_mode(0o4755)).unwrap();
+    fs::create_dir(&special_path).unwrap();
+    // A sticky directory exercises the same clearing-and-warning path without
+    // creating a setuid file, which Nix forbids and Darwin restricts.
+    fs::set_permissions(&special_path, fs::Permissions::from_mode(0o1755)).unwrap();
     let warning = run_xsync(&[
         "--progress=always".as_ref(),
         "--out".as_ref(),

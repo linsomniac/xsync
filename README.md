@@ -37,6 +37,45 @@ operation events.
 The remote host must have `xsync` installed. Use `--ssh 'ssh -p 2222'` to
 customize transport or `--remote-program /path/to/xsync` to select its binary.
 
+## Nix and NixOS
+
+The repository is a flake with packages for x86_64 and ARM64 Linux and macOS.
+Run xsync without installing it, or install it into your user profile:
+
+```sh
+nix run github:linsomniac/xsync -- --help
+nix profile install github:linsomniac/xsync
+```
+
+For a flake-based NixOS configuration, add xsync as an input:
+
+```nix
+{
+  inputs.xsync.url = "github:linsomniac/xsync";
+
+  outputs = { nixpkgs, xsync, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ({ pkgs, ... }: {
+          environment.systemPackages = [
+            xsync.packages.${pkgs.stdenv.hostPlatform.system}.default
+          ];
+        })
+      ];
+    };
+  };
+}
+```
+
+An overlay is also available as `xsync.overlays.default`, exposing the package
+as `pkgs.xsync`. Install xsync on both the initiating and SSH endpoint machines;
+their protocol versions must be compatible.
+
+For development, `nix develop` provides Rust, Cargo, rustfmt, Clippy, and
+rust-analyzer. `nix flake check` builds the package and runs its test suite;
+use the Cargo commands below for formatting and Clippy checks.
+
 ## Development
 
 The CI-equivalent local checks are:

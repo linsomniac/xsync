@@ -54,6 +54,24 @@ jobs:
       - name: Check all targets with MSRV
         run: cargo +1.88.0 check --all-targets --locked
 
+  nix:
+    name: Nix flake
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Evaluate all flake systems
+        run: nix flake check --all-systems --no-build --no-update-lock-file
+
+      - name: Build and test native package
+        run: nix flake check --print-build-logs --no-update-lock-file
+
   platform-builds:
     name: Package ${{ matrix.target }}
     strategy:
