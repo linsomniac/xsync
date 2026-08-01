@@ -206,7 +206,9 @@ fn newer_side_wins_in_both_directions_and_delta_reuses_data() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(fs::read(remote.path().join("large")).unwrap(), changed);
-    assert!(String::from_utf8_lossy(&output.stderr).contains("reused"));
+    let progress = String::from_utf8_lossy(&output.stderr);
+    assert!(progress.contains("reused"));
+    assert!(progress.contains(" KiB/s") || progress.contains(" MiB/s"));
 
     let mut remote_changed = changed.clone();
     remote_changed.splice(5000..5000, b"remote-change".iter().copied());
@@ -293,7 +295,7 @@ fn equal_time_divergence_conflicts_without_mutation_and_dry_run_is_clean() {
 
     fs::write(local.path().join("dry"), b"planned").unwrap();
     let output = run_xsync(&[
-        "--dry-run".as_ref(),
+        "-n".as_ref(),
         os(local.path()),
         "--dest".as_ref(),
         os(remote.path()),

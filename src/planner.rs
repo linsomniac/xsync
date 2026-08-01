@@ -15,6 +15,13 @@ pub enum Side {
     Remote,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MetadataPolicy {
+    pub owner: bool,
+    pub group: bool,
+    pub numeric_ids: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
     CreateDirectory { target: Side, entry: ManifestEntry },
@@ -165,6 +172,7 @@ pub fn build_plan(
         direction,
         modify_window_ns,
         digests,
+        MetadataPolicy::default(),
         MAX_PLAN_BYTES,
     )
 }
@@ -175,6 +183,7 @@ pub fn build_plan_with_budget(
     direction: Direction,
     modify_window_ns: i128,
     digests: Option<&Digests>,
+    metadata_policy: MetadataPolicy,
     memory_limit: usize,
 ) -> Result<Plan> {
     local.validate(true)?;
@@ -228,7 +237,15 @@ pub fn build_plan_with_budget(
                 blocked = Some(path);
             }
             (Some(left), Some(right)) => {
-                plan_both(&mut plan, left, right, direction, modify_window_ns, digests)?;
+                plan_both(
+                    &mut plan,
+                    left,
+                    right,
+                    direction,
+                    modify_window_ns,
+                    digests,
+                    metadata_policy,
+                )?;
             }
             (None, None) => unreachable!(),
         }
@@ -301,20 +318,21 @@ fn plan_both(
     direction: Direction,
     window: i128,
     digests: Option<&Digests>,
+    metadata_policy: MetadataPolicy,
 ) -> Result<()> {
     match local.kind {
         EntryKind::File => {
             if times_equal(local, remote, window) {
                 if local.size != remote.size || digest_differs(digests, local, remote)? {
                     plan.push_conflict(local.path.clone())?;
-                } else if (local.mode & 0o777) != (remote.mode & 0o777)
-                    || local.uid != remote.uid
-                    || local.gid != remote.gid
+                } else if let Some(differences) =
+                    metadata_differences(local, remote, metadata_policy, true)
                 {
                     plan.push_warning(
                         local.path.clone(),
-                        "equal-mtime file metadata differs; content and metadata left unchanged"
-                            .into(),
+                        format!(
+                            "equal-mtime file metadata differs: {differences}; neither side is newer, so metadata was left unchanged"
+                        ),
                     )?;
                 }
                 return Ok(());
@@ -324,6 +342,16 @@ fn plan_both(
         EntryKind::Symlink => {
             if local.symlink_target == remote.symlink_target {
                 if times_equal(local, remote, window) {
+                    if let Some(differences) =
+                        metadata_differences(local, remote, metadata_policy, false)
+                    {
+                        plan.push_warning(
+                            local.path.clone(),
+                            format!(
+                                "equal-mtime symlink metadata differs: {differences}; neither side is newer, so metadata was left unchanged"
+                            ),
+                        )?;
+                    }
                     return Ok(());
                 }
                 transfer_newer(plan, local, remote, direction, true)?;
@@ -337,13 +365,14 @@ fn plan_both(
         }
         EntryKind::Directory => {
             if times_equal(local, remote, window) {
-                if (local.mode & 0o777) != (remote.mode & 0o777)
-                    || local.uid != remote.uid
-                    || local.gid != remote.gid
+                if let Some(differences) =
+                    metadata_differences(local, remote, metadata_policy, true)
                 {
                     plan.push_warning(
                         local.path.clone(),
-                        "equal-mtime directory metadata differs".into(),
+                        format!(
+                            "equal-mtime directory metadata differs: {differences}; neither side is newer, so metadata was left unchanged"
+                        ),
                     )?;
                 }
             } else {
@@ -361,6 +390,99 @@ fn plan_both(
         EntryKind::Unsupported => unreachable!("handled as an inventory barrier"),
     }
     Ok(())
+}
+
+fn metadata_differences(
+    local: &ManifestEntry,
+    remote: &ManifestEntry,
+    policy: MetadataPolicy,
+    compare_mode: bool,
+) -> Option<String> {
+    let mut differences = Vec::new();
+    let local_mode = local.mode & 0o777;
+    let remote_mode = remote.mode & 0o777;
+    if compare_mode && local_mode != remote_mode {
+        differences.push(format!(
+            "mode local={local_mode:04o} remote={remote_mode:04o}"
+        ));
+    }
+    if policy.owner
+        && ownership_differs(
+            local.owner_name.as_deref(),
+            local.uid,
+            remote.owner_name.as_deref(),
+            remote.uid,
+            policy.numeric_ids,
+        )
+    {
+        differences.push(format!(
+            "owner local={} remote={}",
+            ownership_display(
+                local.owner_name.as_deref(),
+                local.uid,
+                "uid",
+                policy.numeric_ids
+            ),
+            ownership_display(
+                remote.owner_name.as_deref(),
+                remote.uid,
+                "uid",
+                policy.numeric_ids
+            )
+        ));
+    }
+    if policy.group
+        && ownership_differs(
+            local.group_name.as_deref(),
+            local.gid,
+            remote.group_name.as_deref(),
+            remote.gid,
+            policy.numeric_ids,
+        )
+    {
+        differences.push(format!(
+            "group local={} remote={}",
+            ownership_display(
+                local.group_name.as_deref(),
+                local.gid,
+                "gid",
+                policy.numeric_ids
+            ),
+            ownership_display(
+                remote.group_name.as_deref(),
+                remote.gid,
+                "gid",
+                policy.numeric_ids
+            )
+        ));
+    }
+    (!differences.is_empty()).then(|| differences.join("; "))
+}
+
+fn ownership_differs(
+    local_name: Option<&str>,
+    local_id: u32,
+    remote_name: Option<&str>,
+    remote_id: u32,
+    numeric_ids: bool,
+) -> bool {
+    if numeric_ids {
+        return local_id != remote_id;
+    }
+    match (local_name, remote_name) {
+        (Some(local), Some(remote)) => local != remote,
+        _ => local_id != remote_id,
+    }
+}
+
+fn ownership_display(name: Option<&str>, id: u32, id_label: &str, numeric_ids: bool) -> String {
+    if numeric_ids {
+        format!("{id_label}={id}")
+    } else if let Some(name) = name {
+        format!("{name:?} ({id_label}={id})")
+    } else {
+        format!("{id_label}={id} (name unavailable)")
+    }
 }
 
 fn transfer_newer(
@@ -552,6 +674,23 @@ mod tests {
                 .map(|entry| (entry.path.clone(), entry))
                 .collect(),
         }
+    }
+
+    fn plan_with_metadata_policy(
+        local: ManifestEntry,
+        remote: ManifestEntry,
+        policy: MetadataPolicy,
+    ) -> Plan {
+        build_plan_with_budget(
+            &manifest(vec![local]),
+            &manifest(vec![remote]),
+            Direction::InOut,
+            0,
+            None,
+            policy,
+            MAX_PLAN_BYTES,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -756,8 +895,111 @@ mod tests {
         let remote = manifest(vec![right]);
         let plan = build_plan(&local, &remote, Direction::InOut, 0, None).unwrap();
         assert!(plan.operations.is_empty());
-        assert_eq!(plan.warnings.len(), 1);
-        assert!(plan.warnings[0].1.contains("file metadata differs"));
+        assert_eq!(
+            plan.warnings[0].1,
+            "equal-mtime file metadata differs: mode local=0644 remote=0600; neither side is newer, so metadata was left unchanged"
+        );
+    }
+
+    #[test]
+    fn unrequested_ownership_differences_do_not_warn() {
+        let mut left = entry("file", EntryKind::File, 10, 4);
+        left.uid = 1000;
+        left.gid = 100;
+        left.owner_name = Some("sean".into());
+        left.group_name = Some("users".into());
+        let mut right = left.clone();
+        right.uid = 2000;
+        right.gid = 200;
+        right.owner_name = Some("other".into());
+        right.group_name = Some("staff".into());
+
+        let plan = plan_with_metadata_policy(left, right, MetadataPolicy::default());
+        assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn name_based_ownership_differences_report_both_sides() {
+        let mut left = entry("file", EntryKind::File, 10, 4);
+        left.uid = 1000;
+        left.gid = 100;
+        left.owner_name = Some("sean".into());
+        left.group_name = Some("users".into());
+        let mut right = left.clone();
+        right.uid = 2000;
+        right.gid = 200;
+
+        let policy = MetadataPolicy {
+            owner: true,
+            group: true,
+            numeric_ids: false,
+        };
+        assert!(
+            plan_with_metadata_policy(left.clone(), right.clone(), policy)
+                .warnings
+                .is_empty()
+        );
+
+        right.owner_name = Some("other".into());
+        right.group_name = Some("staff".into());
+        let plan = plan_with_metadata_policy(left, right, policy);
+        assert_eq!(
+            plan.warnings[0].1,
+            "equal-mtime file metadata differs: owner local=\"sean\" (uid=1000) remote=\"other\" (uid=2000); group local=\"users\" (gid=100) remote=\"staff\" (gid=200); neither side is newer, so metadata was left unchanged"
+        );
+    }
+
+    #[test]
+    fn numeric_ownership_and_missing_name_fallback_are_compared_correctly() {
+        let mut left = entry("file", EntryKind::File, 10, 4);
+        left.uid = 1000;
+        left.owner_name = Some("sean".into());
+        let mut right = left.clone();
+        right.owner_name = None;
+        let name_policy = MetadataPolicy {
+            owner: true,
+            ..MetadataPolicy::default()
+        };
+        assert!(
+            plan_with_metadata_policy(left.clone(), right.clone(), name_policy)
+                .warnings
+                .is_empty()
+        );
+
+        right.uid = 2000;
+        right.owner_name = Some("sean".into());
+        let numeric_policy = MetadataPolicy {
+            owner: true,
+            numeric_ids: true,
+            ..MetadataPolicy::default()
+        };
+        let plan = plan_with_metadata_policy(left, right, numeric_policy);
+        assert_eq!(
+            plan.warnings[0].1,
+            "equal-mtime file metadata differs: owner local=uid=1000 remote=uid=2000; neither side is newer, so metadata was left unchanged"
+        );
+    }
+
+    #[test]
+    fn equal_target_symlink_reports_requested_ownership_difference() {
+        let mut left = entry("link", EntryKind::Symlink, 10, 1);
+        left.symlink_target = b"x".to_vec();
+        left.owner_name = Some("sean".into());
+        let mut right = left.clone();
+        right.owner_name = Some("other".into());
+        let plan = plan_with_metadata_policy(
+            left,
+            right,
+            MetadataPolicy {
+                owner: true,
+                ..MetadataPolicy::default()
+            },
+        );
+        assert!(
+            plan.warnings[0]
+                .1
+                .starts_with("equal-mtime symlink metadata differs: owner local=")
+        );
     }
 
     #[test]

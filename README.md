@@ -27,12 +27,13 @@ Examples:
 xsync host.example /home/me/src --exclude target --exclude .git
 xsync backup --out /srv/photos --dest /data/photos /etc --dest /archive/etc
 xsync laptop --progress=json /home/me/notes
-xsync laptop --dry-run /home/me/notes
+xsync laptop -n /home/me/notes
 ```
 
-Use `--dry-run` to print each operation xsync would perform without modifying
-either side. Combine it with `--progress=json` for machine-readable planned
-operation events.
+Use `-n` or `--dry-run` to print each operation xsync would perform without
+modifying either side. Combine it with `--progress=json` for machine-readable
+planned operation events. Human progress displays transfer rates with binary
+units such as `KiB/s` and `MiB/s`; JSON retains numeric bytes per second.
 
 The remote host must have `xsync` installed. Use `--ssh 'ssh -p 2222'` to
 customize transport or `--remote-program /path/to/xsync` to select its binary.

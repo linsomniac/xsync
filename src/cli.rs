@@ -208,7 +208,7 @@ pub fn parse(args: Vec<OsString>, cwd: PathBuf) -> Result<Invocation> {
                 Direction::InOut,
                 "global",
             )?,
-            "--dry-run" => dry_run = true,
+            "--dry-run" | "-n" => dry_run = true,
             "--checksum" => checksum = true,
             "--ignore-clock-skew" => ignore_clock_skew = true,
             "--owner" => preserve_owner = true,
@@ -375,7 +375,7 @@ fn validate_no_overlap(jobs: &[JobConfig]) -> Result<()> {
 pub fn help() -> &'static str {
     "xsync - stateless bidirectional directory synchronization\n\n\
 Usage:\n  xsync SERVER [GLOBAL_OPTIONS] DIR [DIRECTORY_OPTIONS]...\n  xsync --agent\n\n\
-Global options (before the first directory):\n  --in | --out | --in-out       Allowed transfer direction (default: in-out)\n  --ssh COMMAND                 SSH command (default: ssh)\n  --remote-program PATH         Remote xsync executable (default: xsync)\n  --progress[=MODE]             auto, always, never, or json\n  --dry-run                     Show planned changes without modifying files\n  --checksum                    Hash metadata-equal files\n  --modify-window SECONDS       Mtime equality window (default: 0)\n  --max-clock-skew SECONDS      Refuse unsafe clock skew (default: 60)\n  --ignore-clock-skew           Warn but do not refuse for clock skew\n  --owner --group --numeric-ids Ownership preservation controls\n  -v, --verbose | -q, --quiet   Diagnostic verbosity\n  --dir PATH                    Explicit directory (including leading '-')\n\n\
+Global options (before the first directory):\n  --in | --out | --in-out       Allowed transfer direction (default: in-out)\n  --ssh COMMAND                 SSH command (default: ssh)\n  --remote-program PATH         Remote xsync executable (default: xsync)\n  --progress[=MODE]             auto, always, never, or json\n  -n, --dry-run                 Show planned changes without modifying files\n  --checksum                    Hash metadata-equal files\n  --modify-window SECONDS       Mtime equality window (default: 0)\n  --max-clock-skew SECONDS      Refuse unsafe clock skew (default: 60)\n  --ignore-clock-skew           Warn but do not refuse for clock skew\n  --owner --group --numeric-ids Ownership preservation controls\n  -v, --verbose | -q, --quiet   Diagnostic verbosity\n  --dir PATH                    Explicit directory (including leading '-')\n\n\
 Directory options:\n  --dest ABSOLUTE_PATH          Override the remote root\n  --exclude PATTERN             Repeatable symmetric exclusion\n  --in | --out | --in-out       Override direction for this directory\n\n\
 Absence never implies deletion. Equal-time divergent files are conflicts.\n"
 }
@@ -518,6 +518,11 @@ mod tests {
         assert_eq!(config.max_clock_skew_ns, 2_000_000_000);
         assert!(config.preserve_owner && config.numeric_ids);
         assert!(config.dry_run);
+    }
+
+    #[test]
+    fn parses_short_dry_run_option() {
+        assert!(run(&["host", "-n", "/data"]).dry_run);
     }
 
     #[test]

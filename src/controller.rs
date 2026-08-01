@@ -21,7 +21,7 @@ use crate::{
     exclude::Excludes,
     filesystem::{OwnershipPolicy, RootDir},
     manifest::Manifest,
-    planner::{Digests, Operation, Side, ambiguous_paths, build_plan_with_budget},
+    planner::{Digests, MetadataPolicy, Operation, Side, ambiguous_paths, build_plan_with_budget},
     protocol::{
         DigestRecord, EntryResult, Envelope, Framed, JobSummary, Limits, Message, PROTOCOL_MAJOR,
         PROTOCOL_MINOR,
@@ -704,6 +704,11 @@ fn run_job(
         job.direction,
         config.modify_window_ns,
         digests.as_ref(),
+        MetadataPolicy {
+            owner: config.preserve_owner,
+            group: config.preserve_group,
+            numeric_ids: config.numeric_ids,
+        },
         memory.remaining(),
     )?;
     memory.charge(plan.estimated_memory_bytes(), "reconciliation plan")?;
@@ -2043,15 +2048,15 @@ impl ProgressReporter {
             self.json(event);
         } else if self.terminal {
             eprint!(
-                "\r\x1b[2Kxsync: {direction} {path} {logical_bytes}/{total_bytes} bytes, {:.0} B/s{}",
-                rate,
+                "\r\x1b[2Kxsync: {direction} {path} {logical_bytes}/{total_bytes} bytes, {}{}",
+                format_rate(rate),
                 eta.map_or_else(String::new, |seconds| format!(", ETA {seconds:.1}s"))
             );
             let _ = std::io::stderr().flush();
         } else {
             eprintln!(
-                "xsync: {direction} {path} {logical_bytes}/{total_bytes} bytes, {:.0} B/s",
-                rate
+                "xsync: {direction} {path} {logical_bytes}/{total_bytes} bytes, {}",
+                format_rate(rate)
             );
         }
     }
@@ -2086,11 +2091,11 @@ impl ProgressReporter {
             self.json(done);
         } else if self.terminal {
             eprintln!(
-                "xsync: {}/{} entries, {} logical bytes, {:.0} B/s{}",
+                "xsync: {}/{} entries, {} logical bytes, {}{}",
                 self.completed_entries,
                 self.planned_entries,
                 summary.logical_bytes,
-                rate,
+                format_rate(rate),
                 eta.map_or_else(String::new, |seconds| format!(", ETA {seconds:.1}s"))
             );
         }
@@ -2206,6 +2211,22 @@ fn add_json_path(value: &mut serde_json::Value, path: &crate::path::RelativePath
     value["path_base64"] = serde_json::Value::String(path.base64());
 }
 
+fn format_rate(bytes_per_second: f64) -> String {
+    const UNITS: [&str; 7] = ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s", "PiB/s", "EiB/s"];
+
+    let mut value = bytes_per_second.max(0.0);
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 fn operation_direction(operation: &Operation) -> &'static str {
     match operation {
         Operation::CreateDirectory {
@@ -2271,6 +2292,16 @@ mod tests {
             quote_shell_word("/opt/my tools/x'sync"),
             "'/opt/my tools/x'\\''sync'"
         );
+    }
+
+    #[test]
+    fn progress_rates_use_binary_units() {
+        assert_eq!(format_rate(0.0), "0 B/s");
+        assert_eq!(format_rate(1023.0), "1023 B/s");
+        assert_eq!(format_rate(1024.0), "1.0 KiB/s");
+        assert_eq!(format_rate(1536.0), "1.5 KiB/s");
+        assert_eq!(format_rate(1_048_576.0), "1.0 MiB/s");
+        assert_eq!(format_rate(6_187_873.0), "5.9 MiB/s");
     }
 
     #[test]

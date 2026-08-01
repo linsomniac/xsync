@@ -50,7 +50,7 @@ Global options must precede the first directory:
 - `--progress=MODE` selects `auto`, `always`, `never`, or `json`; bare
   `--progress` means `always` and never consumes the following token. `auto`
   renders only when stderr is a terminal.
-- `--dry-run` performs handshake, scans, and planning but no mutation. It emits
+- `-n` / `--dry-run` performs handshake, scans, and planning but no mutation. It emits
   each planned operation even when automatic progress would normally be silent;
   `--quiet` or `--progress=never` explicitly suppresses this display.
 - `--checksum` hashes same-size/same-mtime regular files to detect ambiguous
@@ -332,17 +332,20 @@ Mtime comparisons use the requested modify window. When both sides contain the
 same kind:
 
 - regular files with equal size and equal mtime are content-equal unless
-  `--checksum` finds differing digests. Equal-time mode/ownership differences
-  are warned about and left unchanged because neither side is newer;
+  `--checksum` finds differing digests. Equal-time permission differences and
+  ownership differences selected by `--owner`/`--group` are warned about and
+  left unchanged because neither side is newer. Warnings name every differing
+  field and show its local and remote values;
 - otherwise the side with the newer mtime is the candidate source;
 - direction permits or suppresses that candidate transfer;
 - directories are merged recursively. Their selected mode/ownership/mtime
   metadata is captured from the permitted newer side before mutations and is
   finalized after children, deepest first. All touched directories are finalized
   even after recoverable child failures, so child creation does not cause mtime
-  oscillation. Equal-time metadata differences produce a warning, leave both
-  metadata copies unchanged, and never block children;
-- symlinks compare target bytes, then use mtime/direction as above.
+  oscillation. Equal-time selected metadata differences produce a warning,
+  leave both metadata copies unchanged, and never block children;
+- symlinks compare target bytes, then use mtime/direction as above. Equal-time,
+  equal-target symlinks compare selected ownership but not mode bits.
 
 Equal mtimes with differing content/size/target are conflicts. Different entry
 kinds are structural conflicts regardless of mtime. Special permission bits are
@@ -418,9 +421,10 @@ both files and directories and produce a structured warning. A future opt-in
 mode may preserve them after a separate privilege review. Ownership is unchanged unless
 `--owner` or `--group` is selected. By default names are resolved on the
 receiver, with numeric ID fallback plus a warning; `--numeric-ids` opts directly
-into numeric mapping. Ownership is applied before final mode because `chown` may
-clear special bits. Permission failure produces a structured warning and does
-not invalidate correct file content. Symlink
+into numeric mapping. Equal-time comparisons likewise use names when both are
+available and otherwise fall back to numeric IDs. Ownership is applied before
+final mode because `chown` may clear special bits. Permission failure produces
+a structured warning and does not invalidate correct file content. Symlink
 ownership/mtime operations use no-follow APIs.
 
 ## 9. Progress, diagnostics, and exit status
@@ -430,8 +434,9 @@ agent diagnostics use stderr.
 
 Human progress uses a throttled single-line terminal redraw for active entries,
 plus job counters and stable summaries. It reports logical, literal/reused
-bytes, per-entry rate, and ETA where meaningful, redraws no more than 10 times
-per second, and degrades to newline events on non-interactive stderr. `auto` is
+bytes, per-entry rate in binary units (`KiB/s`, `MiB/s`, and so on), and ETA
+where meaningful, redraws no more than 10 times per second, and degrades to
+newline events on non-interactive stderr. `auto` is
 silent on non-TTY stderr unless `--verbose` is selected; `--quiet` wins over all
 progress modes. `json` emits versioned JSON Lines with `session_start`,
 `job_start`, `phase`, `entry_start`, `entry_progress`, `entry_summary`,
