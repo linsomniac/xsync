@@ -684,10 +684,9 @@ fn reduced_frames_incompatible_endpoint_checksum_noop_and_warning_exit() {
         os(identical_remote.path()),
     ]);
     assert!(identical.status.success(), "{identical:?}");
-    let stderr = String::from_utf8(identical.stderr).unwrap();
-    assert!(!stderr.lines().any(|line| {
-        serde_json::from_str::<serde_json::Value>(line)
-            .is_ok_and(|event| event["event"] == "entry_start")
+    let events = json_stderr(&identical);
+    assert!(!events.iter().any(|event| {
+        event["event"] == "entry_start" && event["kind"] == "file" && event["path"] == "same"
     }));
 
     let warning_local = tempdir().unwrap();

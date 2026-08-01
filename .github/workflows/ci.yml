@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Format, lint, test, and build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup component add --toolchain stable rustfmt clippy
+          rustup override set stable
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets --locked
+
+  msrv:
+    name: Minimum supported Rust 1.88
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Check all targets with MSRV
+        run: cargo +1.88.0 check --all-targets --locked
+
+  platform-builds:
+    name: Package ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            debian_arch: amd64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            debian_arch: arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            debian_arch: ""
+          - os: macos-15
+            target: aarch64-apple-darwin
+            debian_arch: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust target
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add --toolchain stable "${{ matrix.target }}"
+          rustup override set stable
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Validate release packaging
+        run: ./scripts/package-release.sh "${{ matrix.target }}" "${{ matrix.debian_arch }}"

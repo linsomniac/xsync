@@ -51,3 +51,12 @@ cargo build --release
 
 Tests use a fake SSH transport and never need an SSH account or network access.
 The implementation checklist is tracked in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
+
+## Releases
+
+CI checks formatting, Clippy, tests, release builds, and the Rust 1.88 minimum
+supported version. A tag matching the package version, such as `v0.1.0`, starts
+the release workflow. It publishes Linux amd64/arm64 binary archives and Debian
+packages, macOS Intel/Apple-Silicon binary archives, and a `SHA256SUMS` file to
+the corresponding GitHub Release. The workflow can also be rerun manually for
+an existing tag.

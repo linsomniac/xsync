@@ -2,9 +2,11 @@
 name = "xsync"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Stateless bidirectional directory synchronization over SSH"
 license = "MIT"
+repository = "https://github.com/linsomniac/xsync"
+homepage = "https://github.com/linsomniac/xsync"
 
 [dependencies]
 base64 = "0.22"
