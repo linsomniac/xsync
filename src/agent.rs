@@ -13,8 +13,8 @@ use crate::{
     filesystem::{OwnershipPolicy, RootDir},
     manifest::Manifest,
     protocol::{
-        DigestRecord, EntryResult, Envelope, Framed, JobSummary, Limits, Message, PROTOCOL_MAJOR,
-        PROTOCOL_MINOR, WireError,
+        DigestRecord, EntryResult, Envelope, Framed, JobRootKind, JobSummary, Limits, Message,
+        PROTOCOL_MAJOR, PROTOCOL_MINOR, PathRootRequest, WireError,
     },
 };
 
@@ -28,6 +28,7 @@ struct JobContext {
     preserve_owner: bool,
     preserve_group: bool,
     numeric_ids: bool,
+    delete: bool,
     summary: JobSummary,
     state: JobState,
 }
@@ -104,7 +105,13 @@ pub fn run_io<R: Read, W: Write>(reader: R, writer: W) -> Result<()> {
         return Ok(());
     }
     limits.validate()?;
-    let features = offered_features & crate::protocol::SUPPORTED_FEATURES;
+    let mut features = offered_features & crate::protocol::SUPPORTED_FEATURES;
+    if std::env::var_os("XSYNC_TEST_AGENT_DISABLE_FILE_ROOT").is_some() {
+        features &= !crate::protocol::FEATURE_FILE_ROOT;
+    }
+    if std::env::var_os("XSYNC_TEST_AGENT_DISABLE_DELETE").is_some() {
+        features &= !crate::protocol::FEATURE_DELETE;
+    }
     let mut limits = limits.intersect(Limits::default());
     if let Some(max_frame) = std::env::var("XSYNC_TEST_AGENT_MAX_FRAME")
         .ok()
@@ -145,7 +152,10 @@ pub fn run_io<R: Read, W: Write>(reader: R, writer: W) -> Result<()> {
         last_request = envelope.request_id;
         let request_id = envelope.request_id;
         let job_id = envelope.job_id;
-        let may_start = matches!(&envelope.message, Message::BeginJob { .. }) && job.is_none();
+        let may_start = matches!(
+            &envelope.message,
+            Message::BeginJob { .. } | Message::BeginPathJob { .. }
+        ) && job.is_none();
         let may_end = matches!(&envelope.message, Message::EndSession) && job.is_none();
         if !may_start && !may_end && job.as_ref().map(|context| context.id) != Some(job_id) {
             send_error(
@@ -209,34 +219,7 @@ pub fn run_io<R: Read, W: Write>(reader: R, writer: W) -> Result<()> {
                         continue;
                     }
                 };
-                let prepared: Result<(Option<RootDir>, Option<Manifest>)> =
-                    (|| match std::fs::symlink_metadata(&root_path) {
-                        Ok(metadata) if metadata.is_dir() => {
-                            let root = RootDir::open(&root_path)?;
-                            Ok((Some(root), None))
-                        }
-                        Ok(_) => Err(Error::Io {
-                            path: Some(root_path.clone()),
-                            source: std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                "remote root is not a directory",
-                            ),
-                        }),
-                        Err(error)
-                            if error.kind() == std::io::ErrorKind::NotFound
-                                && direction.permits_local_to_remote() =>
-                        {
-                            if dry_run {
-                                Ok((None, Some(Manifest::default())))
-                            } else {
-                                Ok((
-                                    Some(RootDir::create_and_open(&root_path)?),
-                                    Some(Manifest::default()),
-                                ))
-                            }
-                        }
-                        Err(error) => Err(Error::io(Some(root_path.clone()), error)),
-                    })();
+                let prepared = prepare_directory_root(&root_path, direction, dry_run);
                 let (root, manifest) = match prepared {
                     Ok(prepared) => prepared,
                     Err(error) => {
@@ -284,6 +267,7 @@ pub fn run_io<R: Read, W: Write>(reader: R, writer: W) -> Result<()> {
                     preserve_owner,
                     preserve_group,
                     numeric_ids,
+                    delete: false,
                     summary: JobSummary::default(),
                     state: JobState::Accepted,
                 });
@@ -291,6 +275,85 @@ pub fn run_io<R: Read, W: Write>(reader: R, writer: W) -> Result<()> {
                     request_id,
                     job_id,
                     message: Message::JobAccepted,
+                })?;
+            }
+            Message::BeginPathJob {
+                root,
+                root_request,
+                direction,
+                excludes,
+                dry_run,
+                preserve_owner,
+                preserve_group,
+                numeric_ids,
+                delete,
+            } if job.is_none() => {
+                let root_path = PathBuf::from(OsString::from_vec(root));
+                if !root_path.is_absolute() {
+                    send_error(
+                        &mut framed,
+                        request_id,
+                        job_id,
+                        "invalid-root",
+                        None,
+                        "remote root must be absolute",
+                        true,
+                    )?;
+                    continue;
+                }
+                let excludes = match Excludes::compile(&excludes) {
+                    Ok(excludes) => excludes,
+                    Err(error) => {
+                        send_error(
+                            &mut framed,
+                            request_id,
+                            job_id,
+                            "invalid-exclude",
+                            None,
+                            &error.to_string(),
+                            false,
+                        )?;
+                        continue;
+                    }
+                };
+                let (root_kind, root, manifest) =
+                    match prepare_path_root(&root_path, root_request, direction, dry_run) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            let class = match &error {
+                                Error::Entry { class, .. } => class.as_str(),
+                                _ => "root-open",
+                            };
+                            send_error(
+                                &mut framed,
+                                request_id,
+                                job_id,
+                                class,
+                                None,
+                                &error.to_string(),
+                                false,
+                            )?;
+                            continue;
+                        }
+                    };
+                job = Some(JobContext {
+                    id: job_id,
+                    root,
+                    manifest,
+                    excludes,
+                    dry_run,
+                    direction,
+                    preserve_owner,
+                    preserve_group,
+                    numeric_ids,
+                    delete,
+                    summary: JobSummary::default(),
+                    state: JobState::Accepted,
+                });
+                framed.send(&Envelope {
+                    request_id,
+                    job_id,
+                    message: Message::PathJobAccepted { root_kind },
                 })?;
             }
             Message::ManifestRequest => {
@@ -664,6 +727,53 @@ pub fn run_io<R: Read, W: Write>(reader: R, writer: W) -> Result<()> {
                     message: Message::ApplyResult(to_entry_result(result)),
                 })?;
             }
+            Message::DeleteEntry { entry } => {
+                let context = active_job(&mut job, job_id)?;
+                context.state = JobState::Syncing;
+                if !context.delete || context.direction != crate::cli::Direction::Out {
+                    return Err(Error::Protocol(
+                        "delete request violates job policy or direction".into(),
+                    ));
+                }
+                let authorized = require_manifest(context)?.get(&entry.path) == Some(&entry);
+                let result = if !authorized {
+                    Err(Error::Protocol(
+                        "delete target does not exactly match the receiver manifest".into(),
+                    ))
+                } else if context.dry_run {
+                    Ok(None)
+                } else {
+                    require_root(context)?.delete_entry(&entry)
+                };
+                framed.send(&Envelope {
+                    request_id,
+                    job_id,
+                    message: Message::ApplyResult(to_entry_result(result)),
+                })?;
+            }
+            Message::ValidateAbsent { path } => {
+                let context = active_job(&mut job, job_id)?;
+                context.state = JobState::Syncing;
+                if !context.delete || context.direction != crate::cli::Direction::In {
+                    return Err(Error::Protocol(
+                        "absence request violates job policy or direction".into(),
+                    ));
+                }
+                let result = if require_manifest(context)?.get(&path).is_some() {
+                    Err(Error::entry(
+                        "source-changed",
+                        None,
+                        "source entry appeared after inventory",
+                    ))
+                } else {
+                    require_root(context)?.validate_absent(&path)
+                };
+                framed.send(&Envelope {
+                    request_id,
+                    job_id,
+                    message: Message::ApplyResult(to_entry_result(result.map(|()| None))),
+                })?;
+            }
             Message::FinalizeDirectory {
                 entry,
                 expected_destination,
@@ -735,12 +845,94 @@ pub fn run_io<R: Read, W: Write>(reader: R, writer: W) -> Result<()> {
     }
 }
 
+fn prepare_directory_root(
+    root_path: &std::path::Path,
+    direction: crate::cli::Direction,
+    dry_run: bool,
+) -> Result<(Option<RootDir>, Option<Manifest>)> {
+    match std::fs::symlink_metadata(root_path) {
+        Ok(metadata) if metadata.is_dir() => Ok((Some(RootDir::open(root_path)?), None)),
+        Ok(_) => Err(Error::Io {
+            path: Some(root_path.to_path_buf()),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "remote root is not a directory",
+            ),
+        }),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && direction.permits_local_to_remote() =>
+        {
+            if dry_run {
+                Ok((
+                    None,
+                    Some(Manifest::empty(
+                        crate::manifest::ManifestRootKind::Directory,
+                    )),
+                ))
+            } else {
+                Ok((
+                    Some(RootDir::create_and_open(root_path)?),
+                    Some(Manifest::empty(
+                        crate::manifest::ManifestRootKind::Directory,
+                    )),
+                ))
+            }
+        }
+        Err(error) => Err(Error::io(Some(root_path.to_path_buf()), error)),
+    }
+}
+
+fn prepare_entry_root(
+    root_path: &std::path::Path,
+    direction: crate::cli::Direction,
+) -> Result<(Option<RootDir>, Option<Manifest>)> {
+    match std::fs::symlink_metadata(root_path) {
+        Ok(metadata) if metadata.is_dir() => Err(Error::Protocol(
+            "entry-root preparation selected an existing directory".into(),
+        )),
+        Ok(_) => Ok((Some(RootDir::open_entry(root_path)?), None)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && direction.permits_local_to_remote() =>
+        {
+            Ok((Some(RootDir::open_entry(root_path)?), None))
+        }
+        Err(error) => Err(Error::io(Some(root_path.to_path_buf()), error)),
+    }
+}
+
+fn prepare_path_root(
+    root_path: &std::path::Path,
+    request: PathRootRequest,
+    direction: crate::cli::Direction,
+    dry_run: bool,
+) -> Result<(JobRootKind, Option<RootDir>, Option<Manifest>)> {
+    let existing_kind = match std::fs::symlink_metadata(root_path) {
+        Ok(metadata) if metadata.is_dir() => Some(JobRootKind::Directory),
+        Ok(_) => Some(JobRootKind::Entry),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(Error::io(Some(root_path.to_path_buf()), error)),
+    };
+    let root_kind = existing_kind.unwrap_or(match request {
+        PathRootRequest::Directory | PathRootRequest::Auto => JobRootKind::Directory,
+        PathRootRequest::Entry => JobRootKind::Entry,
+    });
+    let (root, manifest) = match root_kind {
+        JobRootKind::Directory => prepare_directory_root(root_path, direction, dry_run)?,
+        JobRootKind::Entry => prepare_entry_root(root_path, direction)?,
+    };
+    Ok((root_kind, root, manifest))
+}
+
 fn validate_agent_request(
     job: Option<&JobContext>,
     message: &Message,
     features: u64,
 ) -> std::result::Result<(), String> {
-    use crate::protocol::{FEATURE_CHECKSUM, FEATURE_DELTA, FEATURE_OWNERSHIP};
+    use crate::protocol::{
+        FEATURE_CHECKSUM, FEATURE_DELETE, FEATURE_DELTA, FEATURE_FILE_ROOT, FEATURE_OWNERSHIP,
+    };
 
     let state = job.map(|context| context.state);
     match message {
@@ -754,6 +946,32 @@ fn validate_agent_request(
             }
             if (*preserve_owner || *preserve_group) && features & FEATURE_OWNERSHIP == 0 {
                 return Err("job requests unnegotiated ownership support".into());
+            }
+        }
+        Message::BeginPathJob {
+            preserve_owner,
+            preserve_group,
+            delete,
+            direction,
+            ..
+        } => {
+            if job.is_some() {
+                return Err("cannot begin a job while another job is active".into());
+            }
+            if features & FEATURE_FILE_ROOT == 0 {
+                return Err("path-root job uses an unnegotiated feature".into());
+            }
+            if (*preserve_owner || *preserve_group) && features & FEATURE_OWNERSHIP == 0 {
+                return Err("job requests unnegotiated ownership support".into());
+            }
+            if *delete
+                && (features & FEATURE_DELETE == 0
+                    || !matches!(
+                        direction,
+                        crate::cli::Direction::In | crate::cli::Direction::Out
+                    ))
+            {
+                return Err("job requests invalid or unnegotiated delete support".into());
             }
         }
         Message::EndSession if job.is_none() => {}
@@ -776,6 +994,28 @@ fn validate_agent_request(
         | Message::ApplyDirectory { .. }
         | Message::ApplySymlink { .. }
             if matches!(state, Some(JobState::Inventoried | JobState::Syncing)) => {}
+        Message::DeleteEntry { .. }
+            if matches!(state, Some(JobState::Inventoried | JobState::Syncing)) =>
+        {
+            let context = job.expect("matching state has a job");
+            if features & FEATURE_DELETE == 0
+                || !context.delete
+                || context.direction != crate::cli::Direction::Out
+            {
+                return Err("delete request violates negotiated job policy".into());
+            }
+        }
+        Message::ValidateAbsent { .. }
+            if matches!(state, Some(JobState::Inventoried | JobState::Syncing)) =>
+        {
+            let context = job.expect("matching state has a job");
+            if features & FEATURE_DELETE == 0
+                || !context.delete
+                || context.direction != crate::cli::Direction::In
+            {
+                return Err("absence request violates negotiated job policy".into());
+            }
+        }
         Message::FinalizeDirectory { .. }
             if matches!(
                 state,
@@ -1402,8 +1642,39 @@ mod tests {
             preserve_owner: false,
             preserve_group: false,
             numeric_ids: false,
+            delete: false,
             summary: JobSummary::default(),
             state,
+        }
+    }
+
+    fn delete_message() -> Message {
+        let path = crate::path::RelativePath::new(b"receiver-only".to_vec()).unwrap();
+        let mtime = crate::manifest::Timestamp {
+            seconds: 1,
+            nanos: 0,
+        };
+        Message::DeleteEntry {
+            entry: crate::manifest::ManifestEntry {
+                path,
+                kind: crate::manifest::EntryKind::File,
+                mtime,
+                mode: 0o644,
+                uid: 1,
+                gid: 1,
+                owner_name: None,
+                group_name: None,
+                size: 1,
+                symlink_target: Vec::new(),
+                scan_error: None,
+                fingerprint: crate::manifest::Fingerprint {
+                    device: 1,
+                    inode: 1,
+                    kind: crate::manifest::EntryKind::File,
+                    size: 1,
+                    mtime,
+                },
+            },
         }
     }
 
@@ -1496,6 +1767,24 @@ mod tests {
             .is_err()
         );
         assert!(
+            validate_agent_request(
+                None,
+                &Message::BeginPathJob {
+                    root: b"/file".to_vec(),
+                    root_request: PathRootRequest::Entry,
+                    direction: crate::cli::Direction::Out,
+                    excludes: Vec::new(),
+                    dry_run: true,
+                    preserve_owner: false,
+                    preserve_group: false,
+                    numeric_ids: false,
+                    delete: false,
+                },
+                0,
+            )
+            .is_err()
+        );
+        assert!(
             validate_agent_request(Some(&inventoried), &Message::DigestRequest(Vec::new()), 0)
                 .is_err()
         );
@@ -1506,6 +1795,51 @@ mod tests {
                 crate::protocol::FEATURE_CHECKSUM
             )
             .is_ok()
+        );
+        let mut deleting_in = context(JobState::Inventoried);
+        deleting_in.direction = crate::cli::Direction::In;
+        deleting_in.delete = true;
+        let absence = Message::ValidateAbsent {
+            path: crate::path::RelativePath::new(b"receiver-only".to_vec()).unwrap(),
+        };
+        assert!(
+            validate_agent_request(
+                Some(&deleting_in),
+                &absence,
+                crate::protocol::FEATURE_DELETE,
+            )
+            .is_ok()
+        );
+        assert!(validate_agent_request(Some(&deleting_in), &absence, 0).is_err());
+        deleting_in.delete = false;
+        assert!(
+            validate_agent_request(
+                Some(&deleting_in),
+                &absence,
+                crate::protocol::FEATURE_DELETE,
+            )
+            .is_err()
+        );
+        let mut deleting_out = context(JobState::Inventoried);
+        deleting_out.direction = crate::cli::Direction::Out;
+        deleting_out.delete = true;
+        assert!(
+            validate_agent_request(
+                Some(&deleting_out),
+                &delete_message(),
+                crate::protocol::FEATURE_DELETE,
+            )
+            .is_ok()
+        );
+        assert!(validate_agent_request(Some(&deleting_out), &delete_message(), 0).is_err());
+        deleting_out.direction = crate::cli::Direction::In;
+        assert!(
+            validate_agent_request(
+                Some(&deleting_out),
+                &delete_message(),
+                crate::protocol::FEATURE_DELETE,
+            )
+            .is_err()
         );
         let finalizing = context(JobState::Finalizing);
         assert!(
@@ -1520,5 +1854,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn existing_path_type_overrides_root_intent_and_missing_entry_is_not_created() {
+        let parent = tempfile::tempdir().unwrap();
+        let file = parent.path().join("file");
+        let directory = parent.path().join("directory");
+        let missing = parent.path().join("missing");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+
+        let (kind, _, _) = prepare_path_root(
+            &file,
+            PathRootRequest::Directory,
+            crate::cli::Direction::Out,
+            false,
+        )
+        .unwrap();
+        assert_eq!(kind, JobRootKind::Entry);
+        let (kind, _, _) = prepare_path_root(
+            &directory,
+            PathRootRequest::Entry,
+            crate::cli::Direction::Out,
+            false,
+        )
+        .unwrap();
+        assert_eq!(kind, JobRootKind::Directory);
+        let (kind, _, _) = prepare_path_root(
+            &missing,
+            PathRootRequest::Entry,
+            crate::cli::Direction::Out,
+            false,
+        )
+        .unwrap();
+        assert_eq!(kind, JobRootKind::Entry);
+        assert!(!missing.exists());
     }
 }

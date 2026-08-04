@@ -99,6 +99,175 @@ fn wait_for_nonempty_temp(root: &Path) {
 }
 
 #[test]
+fn single_file_root_copies_to_the_exact_destination_path() {
+    let local_parent = tempdir().unwrap();
+    let remote_parent = tempdir().unwrap();
+    let local = local_parent.path().join("xsync_0.1.1_amd64.deb");
+    let remote = remote_parent.path().join("renamed.deb");
+    fs::write(&local, b"package bytes").unwrap();
+    fs::set_permissions(&local, fs::Permissions::from_mode(0o640)).unwrap();
+    set_file_mtime(&local, FileTime::from_unix_time(1_700_000_000, 123)).unwrap();
+
+    let output = run_xsync(&["--out".as_ref(), os(&local), "--dest".as_ref(), os(&remote)]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(remote.is_file());
+    assert_eq!(fs::read(&remote).unwrap(), b"package bytes");
+    let local_metadata = fs::metadata(&local).unwrap();
+    let remote_metadata = fs::metadata(&remote).unwrap();
+    assert_eq!(
+        local_metadata.permissions().mode() & 0o777,
+        remote_metadata.permissions().mode() & 0o777
+    );
+    assert_eq!(
+        (local_metadata.mtime(), local_metadata.mtime_nsec()),
+        (remote_metadata.mtime(), remote_metadata.mtime_nsec())
+    );
+}
+
+#[test]
+fn single_file_root_supports_inbound_missing_and_bidirectional_updates() {
+    let local_parent = tempdir().unwrap();
+    let remote_parent = tempdir().unwrap();
+    let local = local_parent.path().join("local-name");
+    let remote = remote_parent.path().join("remote-name");
+    fs::write(&remote, b"remote source").unwrap();
+    set_file_mtime(&remote, FileTime::from_unix_time(100, 0)).unwrap();
+
+    let inbound = run_xsync(&["--in".as_ref(), os(&local), "--dest".as_ref(), os(&remote)]);
+    assert!(
+        inbound.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inbound.stderr)
+    );
+    assert_eq!(fs::read(&local).unwrap(), b"remote source");
+
+    fs::write(&local, b"newer local source").unwrap();
+    set_file_mtime(&local, FileTime::from_unix_time(200, 0)).unwrap();
+    let bidirectional = run_xsync(&[os(&local), "--dest".as_ref(), os(&remote)]);
+    assert!(
+        bidirectional.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bidirectional.stderr)
+    );
+    assert_eq!(fs::read(&remote).unwrap(), b"newer local source");
+}
+
+#[test]
+fn selected_symlink_root_is_copied_without_following_or_scanning_siblings() {
+    let local_parent = tempdir().unwrap();
+    let remote_parent = tempdir().unwrap();
+    let local = local_parent.path().join("selected-link");
+    let remote = remote_parent.path().join("renamed-link");
+    fs::write(local_parent.path().join("target"), b"target contents").unwrap();
+    fs::write(local_parent.path().join("sibling"), b"do not copy").unwrap();
+    symlink("target", &local).unwrap();
+
+    let output = run_xsync(&[
+        "--out".as_ref(),
+        os(&local),
+        "--dest".as_ref(),
+        os(&remote),
+        "--exclude".as_ref(),
+        "selected-link".as_ref(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_link(&remote).unwrap(), Path::new("target"));
+    assert!(!remote_parent.path().join("target").exists());
+    assert!(!remote_parent.path().join("sibling").exists());
+}
+
+#[test]
+fn legacy_feature_set_keeps_directory_jobs_and_rejects_file_jobs_before_mutation() {
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_ssh.sh");
+    let ssh = format!("sh {}", shlex::try_quote(fake.to_str().unwrap()).unwrap());
+    let binary = Path::new(env!("CARGO_BIN_EXE_xsync"));
+
+    let local_directory = tempdir().unwrap();
+    let remote_directory = tempdir().unwrap();
+    fs::write(local_directory.path().join("file"), b"directory job").unwrap();
+    let directory = xsync_command(binary, &ssh)
+        .env("XSYNC_TEST_AGENT_DISABLE_FILE_ROOT", "1")
+        .args([
+            "--out".as_ref(),
+            os(local_directory.path()),
+            "--dest".as_ref(),
+            os(remote_directory.path()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        directory.status.success(),
+        "{}",
+        String::from_utf8_lossy(&directory.stderr)
+    );
+    assert_eq!(
+        fs::read(remote_directory.path().join("file")).unwrap(),
+        b"directory job"
+    );
+
+    let local_parent = tempdir().unwrap();
+    let remote_parent = tempdir().unwrap();
+    let local_file = local_parent.path().join("file");
+    let remote_file = remote_parent.path().join("file");
+    fs::write(&local_file, b"must not transfer").unwrap();
+    let file = xsync_command(binary, &ssh)
+        .env("XSYNC_TEST_AGENT_DISABLE_FILE_ROOT", "1")
+        .args([
+            "--out".as_ref(),
+            os(&local_file),
+            "--dest".as_ref(),
+            os(&remote_file),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(file.status.code(), Some(3));
+    assert!(!remote_file.exists());
+    assert!(String::from_utf8_lossy(&file.stderr).contains("lacks single-file root support"));
+}
+
+#[test]
+fn single_file_dry_run_and_root_type_conflicts_do_not_mutate() {
+    let local_parent = tempdir().unwrap();
+    let remote_parent = tempdir().unwrap();
+    let local = local_parent.path().join("source");
+    let remote = remote_parent.path().join("missing");
+    fs::write(&local, b"source").unwrap();
+
+    let dry_run = run_xsync(&[
+        "--dry-run".as_ref(),
+        "--progress=always".as_ref(),
+        "--out".as_ref(),
+        os(&local),
+        "--dest".as_ref(),
+        os(&remote),
+    ]);
+    assert!(
+        dry_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    assert!(!remote.exists());
+    assert!(String::from_utf8_lossy(&dry_run.stderr).contains("xsync: would "));
+
+    fs::create_dir(&remote).unwrap();
+    fs::write(remote.join("preserved"), b"keep").unwrap();
+    let conflict = run_xsync(&[os(&local), "--dest".as_ref(), os(&remote)]);
+    assert_eq!(conflict.status.code(), Some(1));
+    assert!(local.is_file());
+    assert!(remote.is_dir());
+    assert_eq!(fs::read(remote.join("preserved")).unwrap(), b"keep");
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("conflict"));
+}
+
+#[test]
 fn copies_out_with_metadata_symlinks_excludes_and_no_delete() {
     let local = tempdir().unwrap();
     let parent = tempdir().unwrap();
@@ -170,6 +339,224 @@ fn copies_out_with_metadata_symlinks_excludes_and_no_delete() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(fs::read(remote.join("remote-only")).unwrap(), b"keep");
+}
+
+#[test]
+fn delete_out_removes_receiver_only_entries_and_preserves_excludes() {
+    let local = tempdir().unwrap();
+    let remote = tempdir().unwrap();
+    fs::write(local.path().join("keep"), b"sender").unwrap();
+    fs::write(remote.path().join("extra-file"), b"remove").unwrap();
+    symlink("nowhere", remote.path().join("extra-link")).unwrap();
+    fs::create_dir(remote.path().join("old-directory")).unwrap();
+    fs::write(remote.path().join("old-directory/child"), b"remove").unwrap();
+    fs::write(remote.path().join("excluded"), b"preserve").unwrap();
+
+    let output = run_xsync(&[
+        "--out".as_ref(),
+        os(local.path()),
+        "--dest".as_ref(),
+        os(remote.path()),
+        "--delete".as_ref(),
+        "--exclude".as_ref(),
+        "excluded".as_ref(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(remote.path().join("keep")).unwrap(), b"sender");
+    assert!(!remote.path().join("extra-file").exists());
+    assert!(fs::symlink_metadata(remote.path().join("extra-link")).is_err());
+    assert!(!remote.path().join("old-directory").exists());
+    assert_eq!(
+        fs::read(remote.path().join("excluded")).unwrap(),
+        b"preserve"
+    );
+}
+
+#[test]
+fn delete_in_removes_local_receiver_only_entries() {
+    let local = tempdir().unwrap();
+    let remote = tempdir().unwrap();
+    fs::write(local.path().join("local-only"), b"remove").unwrap();
+    fs::write(remote.path().join("remote-only"), b"copy").unwrap();
+
+    let output = run_xsync(&[
+        "--in".as_ref(),
+        os(local.path()),
+        "--dest".as_ref(),
+        os(remote.path()),
+        "--delete".as_ref(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!local.path().join("local-only").exists());
+    assert_eq!(fs::read(local.path().join("remote-only")).unwrap(), b"copy");
+}
+
+#[test]
+fn delete_dry_run_reports_removals_without_mutation() {
+    let local = tempdir().unwrap();
+    let remote = tempdir().unwrap();
+    fs::write(remote.path().join("extra"), b"preserve for dry run").unwrap();
+    fs::create_dir(remote.path().join("old-directory")).unwrap();
+
+    let output = run_xsync(&[
+        "--dry-run".as_ref(),
+        "--progress=always".as_ref(),
+        "--out".as_ref(),
+        os(local.path()),
+        "--dest".as_ref(),
+        os(remote.path()),
+        "--delete".as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read(remote.path().join("extra")).unwrap(),
+        b"preserve for dry run"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("would delete-remote file extra"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("would delete-remote directory old-directory")
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("finalize directory metadata old"));
+}
+
+#[test]
+fn excluded_descendant_makes_directory_delete_fail_closed() {
+    let local = tempdir().unwrap();
+    let remote = tempdir().unwrap();
+    fs::create_dir(remote.path().join("protected")).unwrap();
+    fs::write(remote.path().join("protected/keep"), b"keep").unwrap();
+    fs::write(remote.path().join("z-remove"), b"remove").unwrap();
+
+    let output = run_xsync(&[
+        "--progress=always".as_ref(),
+        "--out".as_ref(),
+        os(local.path()),
+        "--dest".as_ref(),
+        os(remote.path()),
+        "--delete".as_ref(),
+        "--exclude".as_ref(),
+        "protected/keep".as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read(remote.path().join("protected/keep")).unwrap(),
+        b"keep"
+    );
+    assert!(!remote.path().join("z-remove").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("directory retained"));
+    assert!(!fs::read_dir(remote.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(b".xsync.recovery.")
+    }));
+}
+
+#[test]
+fn recovery_artifacts_are_never_automatically_deleted() {
+    let local = tempdir().unwrap();
+    let remote = tempdir().unwrap();
+    let recovery = remote.path().join(".xsync.recovery.interrupted");
+    fs::write(&recovery, b"displaced user data").unwrap();
+
+    let output = run_xsync(&[
+        "--progress=always".as_ref(),
+        "--out".as_ref(),
+        os(local.path()),
+        "--dest".as_ref(),
+        os(remote.path()),
+        "--delete".as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs::read(recovery).unwrap(), b"displaced user data");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("recovery artifact is protected"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn missing_delete_feature_fails_before_any_job_mutation() {
+    let local = tempdir().unwrap();
+    let remote = tempdir().unwrap();
+    fs::write(local.path().join("new"), b"must not transfer").unwrap();
+    fs::write(remote.path().join("extra"), b"must not delete").unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_xsync"));
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_ssh.sh");
+    let ssh = format!("sh {}", shlex::try_quote(fake.to_str().unwrap()).unwrap());
+
+    let output = xsync_command(binary, &ssh)
+        .env("XSYNC_TEST_AGENT_DISABLE_DELETE", "1")
+        .args([
+            "--out".as_ref(),
+            os(local.path()),
+            "--dest".as_ref(),
+            os(remote.path()),
+            "--delete".as_ref(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(!remote.path().join("new").exists());
+    assert_eq!(
+        fs::read(remote.path().join("extra")).unwrap(),
+        b"must not delete"
+    );
+}
+
+#[test]
+fn sender_appearance_fails_delete_and_suppresses_later_deletions() {
+    let local = tempdir().unwrap();
+    let remote = tempdir().unwrap();
+    fs::write(local.path().join("large"), vec![b'x'; 8 * 1024 * 1024]).unwrap();
+    fs::write(remote.path().join("extra"), b"keep after race").unwrap();
+    fs::write(remote.path().join("z-delete"), b"suppressed").unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_xsync"));
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_ssh.sh");
+    let ssh = format!("sh {}", shlex::try_quote(fake.to_str().unwrap()).unwrap());
+
+    let child = xsync_command(binary, &ssh)
+        .env("XSYNC_TEST_AGENT_AFTER_DATA_DELAY_MS", "500")
+        .args([
+            "--progress=always".as_ref(),
+            "--out".as_ref(),
+            os(local.path()),
+            "--dest".as_ref(),
+            os(remote.path()),
+            "--delete".as_ref(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_nonempty_temp(remote.path());
+    fs::write(local.path().join("extra"), b"appeared on sender").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        fs::read(remote.path().join("extra")).unwrap(),
+        b"keep after race"
+    );
+    assert_eq!(
+        fs::read(remote.path().join("z-delete")).unwrap(),
+        b"suppressed"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("deletions suppressed after an earlier operation failed")
+    );
 }
 
 #[test]
@@ -407,6 +794,31 @@ fn one_session_handles_multiple_jobs() {
     assert_eq!(fs::read(remote_a.path().join("a")).unwrap(), b"a");
     assert_eq!(fs::read(remote_b.path().join("b")).unwrap(), b"b");
     assert_eq!(fs::read_to_string(count_file).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn root_classification_failure_does_not_prevent_later_jobs() {
+    let missing_parent = tempdir().unwrap();
+    let missing = missing_parent.path().join("gone");
+    let failed_remote = tempdir().unwrap();
+    let good_local = tempdir().unwrap();
+    let good_remote = tempdir().unwrap();
+    fs::write(good_local.path().join("copied"), b"good job").unwrap();
+
+    let output = run_xsync(&[
+        "--out".as_ref(),
+        os(&missing),
+        "--dest".as_ref(),
+        os(failed_remote.path()),
+        os(good_local.path()),
+        "--dest".as_ref(),
+        os(good_remote.path()),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        fs::read(good_remote.path().join("copied")).unwrap(),
+        b"good job"
+    );
 }
 
 #[test]

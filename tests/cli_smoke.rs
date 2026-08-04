@@ -8,7 +8,10 @@ fn xsync() -> Command {
 fn help_and_version_succeed() {
     let help = xsync().arg("--help").output().unwrap();
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage:"));
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(stdout.contains("Usage:"));
+    assert!(stdout.contains("-a, --archive"));
+    assert!(stdout.contains("--delete"));
 
     let version = xsync().arg("--version").output().unwrap();
     assert!(version.status.success());
@@ -19,7 +22,7 @@ fn help_and_version_succeed() {
 fn usage_errors_exit_two_without_terminal_injection() {
     let output = xsync().arg("host").output().unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("at least one directory"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("at least one path"));
 
     let output = xsync()
         .args(["host", "/tmp/a\n\x1b", "/tmp/a\n\x1b/b"])

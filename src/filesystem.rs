@@ -30,10 +30,19 @@ use crate::{
 pub struct RootDir {
     path: PathBuf,
     dir: Dir,
+    sync_root: SyncRoot,
     _lock: std::fs::File,
     directory_identities: Mutex<BTreeMap<RelativePath, Fingerprint>>,
     directory_identity_bytes: AtomicUsize,
     directory_identity_limit: AtomicUsize,
+}
+
+enum SyncRoot {
+    Directory,
+    Entry {
+        name: OsString,
+        fingerprint: Option<Fingerprint>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -85,20 +94,72 @@ impl BasisReader {
 
 impl RootDir {
     pub fn open(path: &Path) -> Result<Self> {
+        reject_reserved_root(path)?;
         let dir = open_root_nofollow(path)?;
-        Self::from_dir(path, dir)
+        Self::from_dir(path, dir, None)
     }
 
-    fn from_dir(path: &Path, dir: Dir) -> Result<Self> {
+    pub fn open_entry(path: &Path) -> Result<Self> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Usage("selected entry root has no parent".into()))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| Error::Usage("selected entry root has no final component".into()))?
+            .to_os_string();
+        if name.as_bytes().starts_with(TEMP_PREFIX) || name.as_bytes().starts_with(RECOVERY_PREFIX)
+        {
+            return Err(Error::Usage(
+                "selected entry root uses an xsync reserved internal prefix".into(),
+            ));
+        }
+        let dir = Dir::open_ambient_dir(parent, ambient_authority()).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Error::entry(
+                    "root-parent-missing",
+                    Some(parent.to_path_buf()),
+                    "selected entry root parent is missing",
+                )
+            } else {
+                Error::io(Some(parent.to_path_buf()), error)
+            }
+        })?;
+        let selected_fingerprint = match dir.symlink_metadata(&name) {
+            Ok(metadata) if metadata.is_dir() => {
+                return Err(Error::Io {
+                    path: Some(path.to_path_buf()),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "selected entry root is a directory",
+                    ),
+                });
+            }
+            Ok(metadata) => Some(cap_fingerprint(&metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(Error::io(Some(path.to_path_buf()), error)),
+        };
+        Self::from_dir(path, dir, Some((name, selected_fingerprint)))
+    }
+
+    fn from_dir(
+        path: &Path,
+        dir: Dir,
+        selected: Option<(OsString, Option<Fingerprint>)>,
+    ) -> Result<Self> {
+        let dir_metadata = dir
+            .symlink_metadata(".")
+            .map_err(|e| Error::io(Some(path.to_path_buf()), e))?;
         let lock = dir
             .open(".")
             .map_err(|e| Error::io(Some(path.to_path_buf()), e))?
             .into_std();
-        flock(&lock, FlockOperation::NonBlockingLockExclusive)
+        let operation = if selected.is_some() {
+            FlockOperation::NonBlockingLockShared
+        } else {
+            FlockOperation::NonBlockingLockExclusive
+        };
+        flock(&lock, operation)
             .map_err(|e| Error::io(Some(path.to_path_buf()), std::io::Error::from(e)))?;
-        let dir_metadata = dir
-            .symlink_metadata(".")
-            .map_err(|e| Error::io(Some(path.to_path_buf()), e))?;
         let lock_metadata = lock
             .metadata()
             .map_err(|e| Error::io(Some(path.to_path_buf()), e))?;
@@ -112,6 +173,10 @@ impl RootDir {
         Ok(Self {
             path: path.to_path_buf(),
             dir,
+            sync_root: match selected {
+                Some((name, fingerprint)) => SyncRoot::Entry { name, fingerprint },
+                None => SyncRoot::Directory,
+            },
             _lock: lock,
             directory_identities: Mutex::new(BTreeMap::from([(
                 RelativePath::root(),
@@ -123,6 +188,7 @@ impl RootDir {
     }
 
     pub fn create_and_open(path: &Path) -> Result<Self> {
+        reject_reserved_root(path)?;
         let parent = path
             .parent()
             .ok_or_else(|| Error::Usage("job root has no parent".into()))?;
@@ -166,7 +232,7 @@ impl RootDir {
             Permissions::from_std(std::fs::Permissions::from_mode(0o700)),
         )
         .map_err(|e| Error::io(Some(path.to_path_buf()), e))?;
-        Self::from_dir(path, dir)
+        Self::from_dir(path, dir, None)
     }
 
     #[must_use]
@@ -188,6 +254,32 @@ impl RootDir {
         limits: crate::protocol::Limits,
         max_bytes: usize,
     ) -> Result<crate::manifest::Manifest> {
+        if let SyncRoot::Entry { name, fingerprint } = &self.sync_root {
+            let manifest = crate::manifest::scan_entry_with_limits(
+                &self.dir,
+                &self.path,
+                name,
+                *fingerprint,
+                usize::try_from(limits.max_entries).unwrap_or(usize::MAX),
+                max_bytes,
+                limits.max_path as usize,
+            )?;
+            let retained = manifest
+                .estimated_memory_bytes()
+                .saturating_add(self.directory_identity_memory_bytes()?);
+            if retained > max_bytes {
+                return Err(Error::entry(
+                    "limit",
+                    Some(self.path.clone()),
+                    "manifest and parent identity exceed job memory budget",
+                ));
+            }
+            self.directory_identity_limit.store(
+                max_bytes.saturating_sub(manifest.estimated_memory_bytes()),
+                Ordering::Release,
+            );
+            return Ok(manifest);
+        }
         let manifest = crate::manifest::scan_dir_with_limits(
             &self.dir,
             &self.path,
@@ -354,12 +446,79 @@ impl RootDir {
         self.validate_current(path, expected, "basis changed while reading")
     }
 
+    pub fn validate_absent(&self, path: &RelativePath) -> Result<()> {
+        if path.is_root() || matches!(&self.sync_root, SyncRoot::Entry { .. }) {
+            return Err(Error::Protocol(
+                "absence validation requires a non-root path in a directory job".into(),
+            ));
+        }
+        let identities = self
+            .directory_identities
+            .lock()
+            .map_err(|_| Error::Protocol("directory identity lock was poisoned".into()))?;
+        let mut directory = self
+            .dir
+            .open_dir_nofollow(".")
+            .map_err(|error| self.io_at(path, error))?;
+        let root_metadata = directory
+            .symlink_metadata(".")
+            .map_err(|error| self.io_at(path, error))?;
+        if !identities
+            .get(&RelativePath::root())
+            .is_some_and(|expected| {
+                same_directory_identity(*expected, cap_fingerprint(&root_metadata))
+            })
+        {
+            return Err(self.changed(path, "source root changed after inventory"));
+        }
+
+        let mut ancestor = RelativePath::root();
+        let mut components = path.as_bytes().split(|&byte| byte == b'/').peekable();
+        while let Some(component) = components.next() {
+            let name = OsStr::from_bytes(component);
+            let metadata = match directory.symlink_metadata(name) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(self.io_at(path, error)),
+            };
+            if components.peek().is_none() {
+                return Err(self.changed(path, "source entry appeared after inventory"));
+            }
+            if !metadata.is_dir() {
+                return Err(self.changed(path, "source ancestor appeared after inventory"));
+            }
+            ancestor = ancestor.join_name(name)?;
+            if !identities.get(&ancestor).is_some_and(|expected| {
+                same_directory_identity(*expected, cap_fingerprint(&metadata))
+            }) {
+                return Err(self.changed(path, "source ancestor changed after inventory"));
+            }
+            directory = directory
+                .open_dir_nofollow(name)
+                .map_err(|error| self.io_at(path, error))?;
+            let opened = directory
+                .symlink_metadata(".")
+                .map_err(|error| self.io_at(path, error))?;
+            if !identities.get(&ancestor).is_some_and(|expected| {
+                same_directory_identity(*expected, cap_fingerprint(&opened))
+            }) {
+                return Err(self.changed(path, "source ancestor changed after inventory"));
+            }
+        }
+        Err(Error::Protocol("invalid empty absence path".into()))
+    }
+
     pub fn create_directory(
         &self,
         entry: &ManifestEntry,
         expected: Option<Fingerprint>,
     ) -> Result<Fingerprint> {
         if entry.path.is_root() {
+            if matches!(&self.sync_root, SyncRoot::Entry { .. }) {
+                return Err(Error::Protocol(
+                    "cannot create a directory for a selected entry root".into(),
+                ));
+            }
             return self.current_fingerprint(&entry.path);
         }
         let identity_charge = 96usize.saturating_add(entry.path.as_bytes().len());
@@ -405,6 +564,73 @@ impl RootDir {
         result
     }
 
+    pub fn delete_entry(&self, entry: &ManifestEntry) -> Result<Option<String>> {
+        if entry.path.is_root() {
+            return Err(Error::Protocol("cannot delete a job root".into()));
+        }
+        if !matches!(
+            entry.kind,
+            EntryKind::File | EntryKind::Directory | EntryKind::Symlink
+        ) {
+            return Err(Error::Protocol("cannot delete an unsupported entry".into()));
+        }
+
+        let (parent, name) = self.parent_dir(&entry.path)?;
+        let before = parent
+            .symlink_metadata(&name)
+            .map_err(|error| self.io_at(&entry.path, error))?;
+        if !deletion_identity_matches(cap_fingerprint(&before), entry.fingerprint) {
+            return Err(self.changed(&entry.path, "destination changed before deletion"));
+        }
+        if entry.kind == EntryKind::Directory {
+            let directory = parent
+                .open_dir_nofollow(&name)
+                .map_err(|error| self.io_at(&entry.path, error))?;
+            let opened = directory
+                .symlink_metadata(".")
+                .map_err(|error| self.io_at(&entry.path, error))?;
+            if !same_directory_identity(cap_fingerprint(&opened), entry.fingerprint) {
+                return Err(self.changed(&entry.path, "destination changed before deletion"));
+            }
+            let mut children = directory
+                .entries()
+                .map_err(|error| self.io_at(&entry.path, error))?;
+            if let Some(child) = children.next() {
+                child.map_err(|error| self.io_at(&entry.path, error))?;
+                return Ok(Some(
+                    "directory retained because it contains an excluded or newly appeared entry"
+                        .into(),
+                ));
+            }
+        }
+
+        run_commit_hook(&entry.path);
+        let recovery = self.preserve_recovery(&parent, &name, &entry.path)?;
+        let moved = parent
+            .symlink_metadata(&recovery)
+            .map_err(|error| self.io_at(&entry.path, error))?;
+        if !deletion_identity_matches(cap_fingerprint(&moved), entry.fingerprint) {
+            self.restore_recovery(&parent, &recovery, &name, entry)?;
+            return Err(self.changed(&entry.path, "destination changed before deletion"));
+        }
+
+        let removal = if entry.kind == EntryKind::Directory {
+            parent.remove_dir(&recovery)
+        } else {
+            parent.remove_file(&recovery)
+        };
+        if let Err(error) = removal {
+            self.restore_recovery(&parent, &recovery, &name, entry)?;
+            return Err(self.io_at(&entry.path, error));
+        }
+
+        match parent.symlink_metadata(&name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Ok(_) => Err(self.changed(&entry.path, "destination appeared during deletion")),
+            Err(error) => Err(self.io_at(&entry.path, error)),
+        }
+    }
+
     fn reserve_directory_identity(&self, charge: usize) -> Result<()> {
         self.directory_identity_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -422,7 +648,7 @@ impl RootDir {
     }
 
     pub fn current_fingerprint(&self, path: &RelativePath) -> Result<Fingerprint> {
-        let metadata = if path.is_root() {
+        let metadata = if path.is_root() && matches!(&self.sync_root, SyncRoot::Directory) {
             self.dir
                 .symlink_metadata(".")
                 .map_err(|e| self.io_at(path, e))?
@@ -587,6 +813,11 @@ impl RootDir {
     ) -> Result<Option<String>> {
         let mode = entry.mode & 0o777;
         if entry.path.is_root() {
+            if matches!(&self.sync_root, SyncRoot::Entry { .. }) {
+                return Err(Error::Protocol(
+                    "cannot finalize a directory for a selected entry root".into(),
+                ));
+            }
             let metadata = self
                 .dir
                 .symlink_metadata(".")
@@ -741,6 +972,34 @@ impl RootDir {
         )))
     }
 
+    fn restore_recovery(
+        &self,
+        parent: &Dir,
+        recovery: &OsStr,
+        name: &OsStr,
+        entry: &ManifestEntry,
+    ) -> Result<()> {
+        renameat_with(parent, recovery, parent, name, RenameFlags::NOREPLACE).map_err(|_| {
+            self.changed(
+                &entry.path,
+                &format!(
+                    "deletion could not be rolled back; original data preserved as {}",
+                    recovery.to_string_lossy()
+                ),
+            )
+        })?;
+        let restored = parent
+            .symlink_metadata(name)
+            .map_err(|error| self.io_at(&entry.path, error))?;
+        if !deletion_identity_matches(cap_fingerprint(&restored), entry.fingerprint) {
+            return Err(self.changed(
+                &entry.path,
+                "deletion rollback did not restore the inventoried entry",
+            ));
+        }
+        Ok(())
+    }
+
     fn remove_if_identity(&self, parent: &Dir, name: &OsStr, expected: Option<Fingerprint>) {
         if let Some(expected) = expected
             && parent
@@ -770,7 +1029,20 @@ impl RootDir {
 
     fn parent_dir(&self, relative: &RelativePath) -> Result<(Dir, OsString)> {
         if relative.is_root() {
-            return Err(Error::Protocol("root path has no parent entry".into()));
+            let SyncRoot::Entry { name, .. } = &self.sync_root else {
+                return Err(Error::Protocol("root path has no parent entry".into()));
+            };
+            let directory = self
+                .dir
+                .open_dir_nofollow(".")
+                .map_err(|error| self.io_at(relative, error))?;
+            self.validate_root_directory_identity(relative, &directory)?;
+            return Ok((directory, name.clone()));
+        }
+        if matches!(&self.sync_root, SyncRoot::Entry { .. }) {
+            return Err(Error::Protocol(
+                "selected entry root cannot contain child paths".into(),
+            ));
         }
         let mut components = relative.as_bytes().split(|&byte| byte == b'/').peekable();
         let mut directory = self
@@ -844,7 +1116,7 @@ impl RootDir {
     }
 
     fn io_at(&self, relative: &RelativePath, source: std::io::Error) -> Error {
-        Error::io(Some(self.path.join(relative.to_path_buf())), source)
+        Error::io(Some(self.display_path(relative)), source)
     }
 
     fn changed(&self, relative: &RelativePath, message: &str) -> Error {
@@ -855,7 +1127,33 @@ impl RootDir {
         } else {
             "destination-changed"
         };
-        Error::entry(class, Some(self.path.join(relative.to_path_buf())), message)
+        Error::entry(class, Some(self.display_path(relative)), message)
+    }
+
+    fn display_path(&self, relative: &RelativePath) -> PathBuf {
+        if matches!(&self.sync_root, SyncRoot::Entry { .. }) && relative.is_root() {
+            self.path.clone()
+        } else {
+            self.path.join(relative.to_path_buf())
+        }
+    }
+
+    fn validate_root_directory_identity(&self, path: &RelativePath, directory: &Dir) -> Result<()> {
+        let identities = self
+            .directory_identities
+            .lock()
+            .map_err(|_| Error::Protocol("directory identity lock was poisoned".into()))?;
+        let metadata = directory
+            .symlink_metadata(".")
+            .map_err(|error| self.io_at(path, error))?;
+        if identities
+            .get(&RelativePath::root())
+            .is_some_and(|expected| same_directory_identity(*expected, cap_fingerprint(&metadata)))
+        {
+            Ok(())
+        } else {
+            Err(self.changed(path, "destination ancestor changed after inventory"))
+        }
     }
 }
 
@@ -875,6 +1173,18 @@ fn open_root_nofollow(path: &Path) -> Result<Dir> {
     parent_dir
         .open_dir_nofollow(name)
         .map_err(|e| Error::io(Some(path.to_path_buf()), e))
+}
+
+fn reject_reserved_root(path: &Path) -> Result<()> {
+    if path.file_name().is_some_and(|name| {
+        name.as_bytes().starts_with(TEMP_PREFIX) || name.as_bytes().starts_with(RECOVERY_PREFIX)
+    }) {
+        Err(Error::Usage(
+            "job root uses an xsync reserved internal prefix".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn cap_fingerprint(metadata: &cap_std::fs::Metadata) -> Fingerprint {
@@ -911,6 +1221,14 @@ fn same_object_identity(left: Fingerprint, right: Fingerprint) -> bool {
     left.device == right.device && left.inode == right.inode && left.kind == right.kind
 }
 
+fn deletion_identity_matches(actual: Fingerprint, expected: Fingerprint) -> bool {
+    if expected.kind == EntryKind::Directory {
+        same_directory_identity(actual, expected)
+    } else {
+        actual == expected
+    }
+}
+
 fn set_mtime(
     dir: &Dir,
     path: impl AsRef<Path>,
@@ -942,14 +1260,13 @@ fn set_mtime(
 type CommitHook = (RelativePath, Box<dyn FnOnce() + Send>);
 
 #[cfg(test)]
-static COMMIT_HOOK: std::sync::Mutex<Option<CommitHook>> = std::sync::Mutex::new(None);
+static COMMIT_HOOK: std::sync::Mutex<Vec<CommitHook>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 fn run_commit_hook(path: &RelativePath) {
-    let mut hook = COMMIT_HOOK.lock().expect("commit hook lock");
-    if hook.as_ref().is_some_and(|(target, _)| target == path)
-        && let Some((_, hook)) = hook.take()
-    {
+    let mut hooks = COMMIT_HOOK.lock().expect("commit hook lock");
+    if let Some(index) = hooks.iter().position(|(target, _)| target == path) {
+        let (_, hook) = hooks.remove(index);
         hook();
     }
 }
@@ -1115,7 +1432,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::manifest::{Fingerprint, Timestamp};
+    use crate::{
+        exclude::Excludes,
+        manifest::{Fingerprint, Timestamp},
+    };
 
     use super::*;
 
@@ -1216,6 +1536,132 @@ mod tests {
     }
 
     #[test]
+    fn deletes_inventoried_files_symlinks_and_empty_directories() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file"), b"data").unwrap();
+        symlink("target", root.path().join("link")).unwrap();
+        fs::create_dir(root.path().join("directory")).unwrap();
+        let receiver = RootDir::open(root.path()).unwrap();
+        let manifest = receiver
+            .scan(&Excludes::default(), crate::protocol::Limits::default())
+            .unwrap();
+        for path in ["file", "link", "directory"] {
+            let warning = receiver
+                .delete_entry(
+                    manifest
+                        .get(&RelativePath::new(path.as_bytes().to_vec()).unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(warning.is_none());
+            assert!(!root.path().join(path).exists());
+        }
+    }
+
+    #[test]
+    fn nonempty_directory_is_retained_without_rename_or_recursive_removal() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("directory")).unwrap();
+        fs::write(root.path().join("directory/keep"), b"keep").unwrap();
+        let receiver = RootDir::open(root.path()).unwrap();
+        let manifest = receiver
+            .scan(&Excludes::default(), crate::protocol::Limits::default())
+            .unwrap();
+        let directory = manifest
+            .get(&RelativePath::new(b"directory".to_vec()).unwrap())
+            .unwrap();
+        assert!(
+            receiver
+                .delete_entry(directory)
+                .unwrap()
+                .as_deref()
+                .is_some_and(|warning| warning.contains("retained"))
+        );
+        assert_eq!(
+            fs::read(root.path().join("directory/keep")).unwrap(),
+            b"keep"
+        );
+        assert!(!fs::read_dir(root.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .as_bytes()
+                .starts_with(RECOVERY_PREFIX)
+        }));
+    }
+
+    #[test]
+    fn directory_child_race_is_rolled_back_from_recovery() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("directory");
+        fs::create_dir(&path).unwrap();
+        let receiver = RootDir::open(root.path()).unwrap();
+        let manifest = receiver
+            .scan(&Excludes::default(), crate::protocol::Limits::default())
+            .unwrap();
+        let directory = manifest
+            .get(&RelativePath::new(b"directory".to_vec()).unwrap())
+            .unwrap()
+            .clone();
+        COMMIT_HOOK.lock().unwrap().push((
+            directory.path.clone(),
+            Box::new(move || fs::write(path.join("appeared"), b"keep").unwrap()),
+        ));
+
+        assert!(receiver.delete_entry(&directory).is_err());
+        assert_eq!(
+            fs::read(root.path().join("directory/appeared")).unwrap(),
+            b"keep"
+        );
+        assert!(!fs::read_dir(root.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .as_bytes()
+                .starts_with(RECOVERY_PREFIX)
+        }));
+    }
+
+    #[test]
+    fn delete_race_never_removes_the_replacement() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("file");
+        let saved = root.path().join("saved");
+        fs::write(&path, b"original").unwrap();
+        let receiver = RootDir::open(root.path()).unwrap();
+        let manifest = receiver
+            .scan(&Excludes::default(), crate::protocol::Limits::default())
+            .unwrap();
+        let file = manifest
+            .get(&RelativePath::new(b"file".to_vec()).unwrap())
+            .unwrap()
+            .clone();
+        let hook_path = path.clone();
+        COMMIT_HOOK.lock().unwrap().push((
+            file.path.clone(),
+            Box::new(move || {
+                fs::rename(&hook_path, &saved).unwrap();
+                fs::write(&hook_path, b"replacement").unwrap();
+            }),
+        ));
+        assert!(receiver.delete_entry(&file).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn absence_validation_detects_a_new_sender_entry() {
+        let root = tempdir().unwrap();
+        let sender = RootDir::open(root.path()).unwrap();
+        sender
+            .scan(&Excludes::default(), crate::protocol::Limits::default())
+            .unwrap();
+        let path = RelativePath::new(b"missing/child".to_vec()).unwrap();
+        sender.validate_absent(&path).unwrap();
+        fs::create_dir(root.path().join("missing")).unwrap();
+        assert!(sender.validate_absent(&path).is_err());
+    }
+
+    #[test]
     fn destination_swap_between_validation_and_rename_is_rolled_back() {
         let root = tempdir().unwrap();
         let path = root.path().join("race-file");
@@ -1228,7 +1674,7 @@ mod tests {
         let mut file = entry("race-file", EntryKind::File, 0o644);
         file.size = 3;
         let hook_path = path.clone();
-        COMMIT_HOOK.lock().unwrap().replace((
+        COMMIT_HOOK.lock().unwrap().push((
             RelativePath::new(b"race-file".to_vec()).unwrap(),
             Box::new(move || {
                 fs::rename(&hook_path, &saved).unwrap();
@@ -1338,7 +1784,7 @@ mod tests {
         let receiver = RootDir::open(&root).unwrap();
         let relative = RelativePath::new(b"crash-race".to_vec()).unwrap();
         let expected = receiver.current_fingerprint(&relative).unwrap();
-        COMMIT_HOOK.lock().unwrap().replace((
+        COMMIT_HOOK.lock().unwrap().push((
             relative.clone(),
             Box::new(move || {
                 fs::rename(&destination, saved).unwrap();
@@ -1361,6 +1807,33 @@ mod tests {
         let root = tempdir().unwrap();
         let _first = RootDir::open(root.path()).unwrap();
         assert!(RootDir::open(root.path()).is_err());
+    }
+
+    #[test]
+    fn selected_entry_shared_locks_in_one_parent_can_coexist() {
+        let parent = tempdir().unwrap();
+        let first = parent.path().join("first");
+        let second = parent.path().join("second");
+        fs::write(&first, b"one").unwrap();
+        fs::write(&second, b"two").unwrap();
+        let _first_root = RootDir::open_entry(&first).unwrap();
+        let _second_root = RootDir::open_entry(&second).unwrap();
+    }
+
+    #[test]
+    fn selected_entry_shared_lock_conflicts_with_parent_directory_exclusive_lock() {
+        let parent = tempdir().unwrap();
+        let selected = parent.path().join("selected");
+        fs::write(&selected, b"data").unwrap();
+
+        {
+            let _directory_root = RootDir::open(parent.path()).unwrap();
+            assert!(RootDir::open_entry(&selected).is_err());
+        }
+        {
+            let _entry_root = RootDir::open_entry(&selected).unwrap();
+            assert!(RootDir::open(parent.path()).is_err());
+        }
     }
 
     #[test]

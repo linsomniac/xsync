@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{IsTerminal, Read, Seek, SeekFrom, Write as _},
     os::fd::AsFd,
     os::unix::ffi::OsStrExt,
@@ -20,11 +20,14 @@ use crate::{
     delta,
     exclude::Excludes,
     filesystem::{OwnershipPolicy, RootDir},
-    manifest::Manifest,
-    planner::{Digests, MetadataPolicy, Operation, Side, ambiguous_paths, build_plan_with_budget},
+    manifest::{Manifest, ManifestRootKind},
+    planner::{
+        Digests, MetadataPolicy, Operation, PlanningPolicy, Side, ambiguous_paths,
+        build_plan_with_budget,
+    },
     protocol::{
-        DigestRecord, EntryResult, Envelope, Framed, JobSummary, Limits, Message, PROTOCOL_MAJOR,
-        PROTOCOL_MINOR,
+        DigestRecord, EntryResult, Envelope, Framed, JobRootKind, JobSummary, Limits, Message,
+        PROTOCOL_MAJOR, PROTOCOL_MINOR, PathRootRequest,
     },
 };
 
@@ -67,12 +70,36 @@ pub fn run(config: &Config) -> Result<JobSummary> {
         let mut progress = ProgressReporter::new(config);
         progress.session_start(config.jobs.len());
         session.handshake(config)?;
+        let root_requests = config
+            .jobs
+            .iter()
+            .map(classify_local_root)
+            .collect::<Vec<_>>();
+        if session.features & crate::protocol::FEATURE_FILE_ROOT == 0
+            && root_requests
+                .iter()
+                .filter_map(|request| request.as_ref().ok())
+                .any(|request| *request != PathRootRequest::Directory)
+        {
+            return Err(Error::Transport(
+                "remote endpoint lacks single-file root support required by this job".into(),
+            ));
+        }
         let mut total = JobSummary::default();
-        for (index, job) in config.jobs.iter().enumerate() {
+        for (index, (job, root_request)) in config.jobs.iter().zip(root_requests).enumerate() {
             check_interrupted(&interrupted)?;
             let job_id = index as u64 + 1;
-            let summary = match run_job(&mut session, config, job, job_id, index + 1, &mut progress)
-            {
+            let summary = match root_request.and_then(|root_request| {
+                run_job(
+                    &mut session,
+                    config,
+                    job,
+                    root_request,
+                    job_id,
+                    index + 1,
+                    &mut progress,
+                )
+            }) {
                 Ok(summary) => summary,
                 Err(error @ (Error::Io { .. } | Error::Entry { .. })) => {
                     let message = error.to_string();
@@ -305,6 +332,9 @@ impl RemoteSession {
                     || (config.checksum && features & crate::protocol::FEATURE_CHECKSUM == 0)
                     || ((config.preserve_owner || config.preserve_group)
                         && features & crate::protocol::FEATURE_OWNERSHIP == 0)
+                    || (config.jobs.iter().any(|job| job.delete)
+                        && (features & crate::protocol::FEATURE_DELETE == 0
+                            || features & crate::protocol::FEATURE_FILE_ROOT == 0))
                 {
                     return Err(Error::Transport(
                         "remote endpoint lacks a required protocol feature".into(),
@@ -603,6 +633,7 @@ fn run_job(
     session: &mut RemoteSession,
     config: &Config,
     job: &JobConfig,
+    local_root_request: PathRootRequest,
     job_id: u64,
     job_number: usize,
     progress: &mut ProgressReporter,
@@ -618,14 +649,29 @@ fn run_job(
             "remote root exceeds the negotiated path/frame limit",
         ));
     }
-    let begin_job = Message::BeginJob {
-        root: remote_root,
-        direction: job.direction,
-        excludes: job.excludes.clone(),
-        dry_run: config.dry_run,
-        preserve_owner: config.preserve_owner,
-        preserve_group: config.preserve_group,
-        numeric_ids: config.numeric_ids,
+    let path_roots = session.features & crate::protocol::FEATURE_FILE_ROOT != 0;
+    let begin_job = if path_roots {
+        Message::BeginPathJob {
+            root: remote_root,
+            root_request: local_root_request,
+            direction: job.direction,
+            excludes: job.excludes.clone(),
+            dry_run: config.dry_run,
+            preserve_owner: config.preserve_owner,
+            preserve_group: config.preserve_group,
+            numeric_ids: config.numeric_ids,
+            delete: job.delete,
+        }
+    } else {
+        Message::BeginJob {
+            root: remote_root,
+            direction: job.direction,
+            excludes: job.excludes.clone(),
+            dry_run: config.dry_run,
+            preserve_owner: config.preserve_owner,
+            preserve_group: config.preserve_group,
+            numeric_ids: config.numeric_ids,
+        }
     };
     if crate::protocol::encoded_envelope_len(&Envelope {
         request_id: session.next_request,
@@ -639,14 +685,15 @@ fn run_job(
             "job root and exclude options exceed the negotiated frame limit",
         ));
     }
-    match session.rpc(job_id, begin_job)? {
-        Message::JobAccepted => {}
+    let remote_root_kind = match session.rpc(job_id, begin_job)? {
+        Message::PathJobAccepted { root_kind } if path_roots => root_kind,
+        Message::JobAccepted if !path_roots => JobRootKind::Directory,
         other => {
             return Err(Error::Protocol(format!(
                 "unexpected BeginJob response: {other:?}"
             )));
         }
-    }
+    };
     progress.job_start(job_number, job);
     session.active_job = Some(job_id);
     progress.phase("inventory", None);
@@ -662,6 +709,8 @@ fn run_job(
     let mut memory = JobMemoryBudget { used: 0 };
     let local_inventory = open_local(
         job,
+        local_root_request,
+        remote_root_kind,
         config.dry_run,
         &excludes,
         session.limits,
@@ -681,7 +730,13 @@ fn run_job(
             "local directory identity map",
         )?;
     }
-    let remote_manifest = receive_manifest(session, manifest_request, job_id, memory.remaining())?;
+    let remote_manifest = receive_manifest(
+        session,
+        manifest_request,
+        job_id,
+        manifest_root_kind(remote_root_kind),
+        memory.remaining(),
+    )?;
     memory.charge(remote_manifest.estimated_memory_bytes(), "remote manifest")?;
 
     let (digests, checksum_failures) = if config.checksum {
@@ -704,10 +759,14 @@ fn run_job(
         job.direction,
         config.modify_window_ns,
         digests.as_ref(),
-        MetadataPolicy {
-            owner: config.preserve_owner,
-            group: config.preserve_group,
-            numeric_ids: config.numeric_ids,
+        PlanningPolicy {
+            metadata: MetadataPolicy {
+                owner: config.preserve_owner,
+                group: config.preserve_group,
+                numeric_ids: config.numeric_ids,
+            },
+            delete: job.delete,
+            excludes: Some(&excludes),
         },
         memory.remaining(),
     )?;
@@ -720,6 +779,7 @@ fn run_job(
         ..JobSummary::default()
     };
     let mut created_directories = BTreeMap::new();
+    let mut deleted_directories = BTreeSet::new();
     let ownership = OwnershipPolicy {
         owner: config.preserve_owner,
         group: config.preserve_group,
@@ -735,12 +795,39 @@ fn run_job(
         progress.warning(path, warning);
     }
 
+    let mut operation_count = 0usize;
     if config.dry_run {
         for operation in &plan.operations {
+            if operation.is_conditional_delete_finalizer() {
+                continue;
+            }
+            operation_count = operation_count.saturating_add(1);
             progress.planned_operation(operation);
         }
     } else {
+        let mut delete_suppression_reported = false;
         for operation in &plan.operations {
+            if let Operation::FinalizeDirectory {
+                target,
+                entry,
+                conditional_on_delete_failure: true,
+            } = operation
+            {
+                if deleted_directories.contains(&(*target, entry.path.clone())) {
+                    continue;
+                }
+                progress.add_planned_entry();
+            }
+            if matches!(operation, Operation::DeleteEntry { .. }) && summary.errors > 0 {
+                if !delete_suppression_reported {
+                    let warning = "deletions suppressed after an earlier operation failed";
+                    progress.warning(operation.path(), warning);
+                    summary.warnings = summary.warnings.saturating_add(1);
+                    delete_suppression_reported = true;
+                }
+                continue;
+            }
+            operation_count = operation_count.saturating_add(1);
             progress.entry_start(operation);
             if let Err(error) = execute_operation(
                 session,
@@ -753,6 +840,7 @@ fn run_job(
                 operation,
                 &mut summary,
                 &mut created_directories,
+                &mut deleted_directories,
                 ownership,
                 progress,
             ) {
@@ -776,44 +864,98 @@ fn run_job(
             )));
         }
     }
-    progress.job_done(job, &summary, plan.operations.len());
+    progress.job_done(job, &summary, operation_count);
     Ok(summary)
 }
 
 fn open_local(
     job: &JobConfig,
+    request: PathRootRequest,
+    remote_root_kind: JobRootKind,
     dry_run: bool,
     excludes: &Excludes,
     limits: Limits,
     max_memory: usize,
 ) -> Result<(Option<RootDir>, Manifest)> {
-    match std::fs::symlink_metadata(&job.local) {
-        Ok(metadata) if metadata.is_dir() => {
+    let actual = match std::fs::symlink_metadata(&job.local) {
+        Ok(metadata) if metadata.is_dir() => Some(JobRootKind::Directory),
+        Ok(_) => Some(JobRootKind::Entry),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(Error::io(Some(job.local.clone()), error)),
+    };
+    let selected = match (request, actual) {
+        (PathRootRequest::Directory, Some(JobRootKind::Directory)) => JobRootKind::Directory,
+        (PathRootRequest::Entry, Some(JobRootKind::Entry)) => JobRootKind::Entry,
+        (PathRootRequest::Auto, Some(kind)) => kind,
+        (PathRootRequest::Auto, None) if job.direction.permits_remote_to_local() => {
+            remote_root_kind
+        }
+        (PathRootRequest::Directory | PathRootRequest::Entry, None) => {
+            return Err(Error::entry(
+                "root-changed",
+                Some(job.local.clone()),
+                "local job root disappeared after session setup",
+            ));
+        }
+        (PathRootRequest::Directory | PathRootRequest::Entry, Some(_)) => {
+            return Err(Error::entry(
+                "root-changed",
+                Some(job.local.clone()),
+                "local job root changed type after session setup",
+            ));
+        }
+        (PathRootRequest::Auto, None) => {
+            return Err(Error::io(
+                Some(job.local.clone()),
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "local job root does not exist",
+                ),
+            ));
+        }
+    };
+    match (selected, actual) {
+        (JobRootKind::Directory, Some(_)) => {
             let root = RootDir::open(&job.local)?;
             let manifest = root.scan_with_budget(excludes, limits, max_memory)?;
             Ok((Some(root), manifest))
         }
-        Ok(_) => Err(Error::Io {
-            path: Some(job.local.clone()),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "local root is not a directory",
-            ),
-        }),
+        (JobRootKind::Directory, None) => {
+            if dry_run {
+                Ok((None, Manifest::empty(ManifestRootKind::Directory)))
+            } else {
+                Ok((
+                    Some(RootDir::create_and_open(&job.local)?),
+                    Manifest::empty(ManifestRootKind::Directory),
+                ))
+            }
+        }
+        (JobRootKind::Entry, _) => {
+            let root = RootDir::open_entry(&job.local)?;
+            let manifest = root.scan_with_budget(excludes, limits, max_memory)?;
+            Ok((Some(root), manifest))
+        }
+    }
+}
+
+fn classify_local_root(job: &JobConfig) -> Result<PathRootRequest> {
+    match std::fs::symlink_metadata(&job.local) {
+        Ok(metadata) if metadata.is_dir() => Ok(PathRootRequest::Directory),
+        Ok(_) => Ok(PathRootRequest::Entry),
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
                 && job.direction.permits_remote_to_local() =>
         {
-            if dry_run {
-                Ok((None, Manifest::default()))
-            } else {
-                Ok((
-                    Some(RootDir::create_and_open(&job.local)?),
-                    Manifest::default(),
-                ))
-            }
+            Ok(PathRootRequest::Auto)
         }
         Err(error) => Err(Error::io(Some(job.local.clone()), error)),
+    }
+}
+
+const fn manifest_root_kind(kind: JobRootKind) -> ManifestRootKind {
+    match kind {
+        JobRootKind::Directory => ManifestRootKind::Directory,
+        JobRootKind::Entry => ManifestRootKind::Entry,
     }
 }
 
@@ -821,9 +963,10 @@ fn receive_manifest(
     session: &mut RemoteSession,
     request_id: u64,
     job_id: u64,
+    root_kind: ManifestRootKind,
     max_memory: usize,
 ) -> Result<Manifest> {
-    let mut manifest = Manifest::default();
+    let mut manifest = Manifest::empty(root_kind);
     let mut bytes = 0usize;
     let (declared_records, declared_bytes) = match session.receive_for(request_id, job_id)? {
         Message::StreamStart { records, bytes } => (records, bytes),
@@ -1065,6 +1208,7 @@ fn execute_operation(
         (Side, crate::path::RelativePath),
         crate::manifest::Fingerprint,
     >,
+    deleted_directories: &mut BTreeSet<(Side, crate::path::RelativePath)>,
     ownership: OwnershipPolicy,
     progress: &mut ProgressReporter,
 ) -> Result<()> {
@@ -1189,10 +1333,65 @@ fn execute_operation(
                 progress.warning(&entry.path, &warning);
             }
         }
-        Operation::FinalizeDirectory {
+        Operation::DeleteEntry {
             target: Side::Remote,
             entry,
         } => {
+            if remote_manifest.get(&entry.path) != Some(entry) {
+                return Err(Error::Protocol(
+                    "remote delete target does not match its manifest".into(),
+                ));
+            }
+            local_root.validate_absent(&entry.path)?;
+            let result = account_apply(
+                session.rpc(
+                    job_id,
+                    Message::DeleteEntry {
+                        entry: entry.clone(),
+                    },
+                )?,
+                summary,
+            )?;
+            if let Some(warning) = &result.warning {
+                progress.warning(&entry.path, warning);
+            } else if entry.kind == crate::manifest::EntryKind::Directory {
+                deleted_directories.insert((Side::Remote, entry.path.clone()));
+            }
+        }
+        Operation::DeleteEntry {
+            target: Side::Local,
+            entry,
+        } => {
+            if local_manifest.get(&entry.path) != Some(entry) {
+                return Err(Error::Protocol(
+                    "local delete target does not match its manifest".into(),
+                ));
+            }
+            account_apply(
+                session.rpc(
+                    job_id,
+                    Message::ValidateAbsent {
+                        path: entry.path.clone(),
+                    },
+                )?,
+                summary,
+            )?;
+            let warning = local_root.delete_entry(entry)?;
+            if let Some(warning) = &warning {
+                summary.warnings = summary.warnings.saturating_add(1);
+                progress.warning(&entry.path, warning);
+            } else if entry.kind == crate::manifest::EntryKind::Directory {
+                deleted_directories.insert((Side::Local, entry.path.clone()));
+            }
+        }
+        Operation::FinalizeDirectory {
+            target: Side::Remote,
+            entry,
+            ..
+        } => {
+            if deleted_directories.contains(&(Side::Remote, entry.path.clone())) {
+                return Ok(());
+            }
             let expected_destination = remote_manifest
                 .get(&entry.path)
                 .map(|entry| entry.fingerprint)
@@ -1221,7 +1420,11 @@ fn execute_operation(
         Operation::FinalizeDirectory {
             target: Side::Local,
             entry,
+            ..
         } => {
+            if deleted_directories.contains(&(Side::Local, entry.path.clone())) {
+                return Ok(());
+            }
             let expected = local_manifest
                 .get(&entry.path)
                 .map(|entry| entry.fingerprint)
@@ -1876,6 +2079,7 @@ struct ProgressReporter {
     completed_entries: usize,
     entry_started: Instant,
     entry_logical_bytes: u64,
+    root_display: Option<String>,
 }
 
 impl ProgressReporter {
@@ -1900,6 +2104,7 @@ impl ProgressReporter {
             completed_entries: 0,
             entry_started: now,
             entry_logical_bytes: 0,
+            root_display: None,
         }
     }
 
@@ -1918,6 +2123,16 @@ impl ProgressReporter {
         self.job_started = Instant::now();
         self.planned_entries = 0;
         self.completed_entries = 0;
+        let separator = match job.direction {
+            crate::cli::Direction::InOut => "<->",
+            crate::cli::Direction::In => "<--",
+            crate::cli::Direction::Out => "-->",
+        };
+        self.root_display = Some(format!(
+            "{} {separator} {}",
+            crate::path::display_absolute(&job.local),
+            crate::path::display_absolute(&job.remote)
+        ));
         if self.quiet {
             return;
         }
@@ -1931,7 +2146,7 @@ impl ProgressReporter {
             }));
         } else {
             eprintln!(
-                "xsync: job {number}/{}: {} <-> {}",
+                "xsync: job {number}/{}: {} {separator} {}",
                 self.jobs,
                 crate::path::display_absolute(&job.local),
                 crate::path::display_absolute(&job.remote)
@@ -1940,7 +2155,15 @@ impl ProgressReporter {
     }
 
     fn plan_ready(&mut self, plan: &crate::planner::Plan) {
-        self.planned_entries = plan.operations.len();
+        self.planned_entries = plan
+            .operations
+            .iter()
+            .filter(|operation| !operation.is_conditional_delete_finalizer())
+            .count();
+    }
+
+    fn add_planned_entry(&mut self) {
+        self.planned_entries = self.planned_entries.saturating_add(1);
     }
 
     fn phase(&mut self, phase: &str, path: Option<&crate::path::RelativePath>) {
@@ -1984,7 +2207,7 @@ impl ProgressReporter {
         } else if !self.terminal
             || self.last_draw.elapsed() >= std::time::Duration::from_millis(100)
         {
-            eprintln!("xsync: {direction} {}", operation.path());
+            eprintln!("xsync: {direction} {}", self.display_path(operation.path()));
             self.last_draw = Instant::now();
         }
     }
@@ -2006,7 +2229,7 @@ impl ProgressReporter {
             eprintln!(
                 "xsync: would {direction} {} {}",
                 operation_description(operation),
-                operation.path()
+                self.display_path(operation.path())
             );
         }
     }
@@ -2047,6 +2270,7 @@ impl ProgressReporter {
             add_json_path(&mut event, path);
             self.json(event);
         } else if self.terminal {
+            let path = self.display_path(path);
             eprint!(
                 "\r\x1b[2Kxsync: {direction} {path} {logical_bytes}/{total_bytes} bytes, {}{}",
                 format_rate(rate),
@@ -2054,6 +2278,7 @@ impl ProgressReporter {
             );
             let _ = std::io::stderr().flush();
         } else {
+            let path = self.display_path(path);
             eprintln!(
                 "xsync: {direction} {path} {logical_bytes}/{total_bytes} bytes, {}",
                 format_rate(rate)
@@ -2194,9 +2419,19 @@ impl ProgressReporter {
             }
             self.json(value);
         } else if let Some(message) = message {
-            eprintln!("xsync: {event}: {path}: {message}");
+            eprintln!("xsync: {event}: {}: {message}", self.display_path(path));
         } else {
-            eprintln!("xsync: {event}: {path}");
+            eprintln!("xsync: {event}: {}", self.display_path(path));
+        }
+    }
+
+    fn display_path(&self, path: &crate::path::RelativePath) -> String {
+        if path.is_root() {
+            self.root_display
+                .clone()
+                .unwrap_or_else(|| path.display_lossy())
+        } else {
+            path.display_lossy()
         }
     }
 
@@ -2245,6 +2480,10 @@ fn operation_direction(operation: &Operation) -> &'static str {
             source: Side::Remote,
             ..
         } => "remote-to-local",
+        Operation::DeleteEntry {
+            target: Side::Local,
+            ..
+        } => "delete-local",
         Operation::CreateDirectory {
             target: Side::Remote,
             ..
@@ -2261,6 +2500,10 @@ fn operation_direction(operation: &Operation) -> &'static str {
             source: Side::Local,
             ..
         } => "local-to-remote",
+        Operation::DeleteEntry {
+            target: Side::Remote,
+            ..
+        } => "delete-remote",
     }
 }
 
@@ -2269,6 +2512,12 @@ fn operation_kind(operation: &Operation) -> &'static str {
         Operation::CreateDirectory { .. } => "create_directory",
         Operation::TransferFile { .. } => "file",
         Operation::WriteSymlink { .. } => "symlink",
+        Operation::DeleteEntry { entry, .. } => match entry.kind {
+            crate::manifest::EntryKind::File => "delete_file",
+            crate::manifest::EntryKind::Directory => "delete_directory",
+            crate::manifest::EntryKind::Symlink => "delete_symlink",
+            crate::manifest::EntryKind::Unsupported => "delete_unsupported",
+        },
         Operation::FinalizeDirectory { .. } => "finalize_directory",
     }
 }
@@ -2278,6 +2527,12 @@ fn operation_description(operation: &Operation) -> &'static str {
         Operation::CreateDirectory { .. } => "create directory",
         Operation::TransferFile { .. } => "transfer file",
         Operation::WriteSymlink { .. } => "write symlink",
+        Operation::DeleteEntry { entry, .. } => match entry.kind {
+            crate::manifest::EntryKind::File => "file",
+            crate::manifest::EntryKind::Directory => "directory",
+            crate::manifest::EntryKind::Symlink => "symlink",
+            crate::manifest::EntryKind::Unsupported => "unsupported entry",
+        },
         Operation::FinalizeDirectory { .. } => "finalize directory metadata",
     }
 }

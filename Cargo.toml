@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Stateless bidirectional directory synchronization over SSH"
-license = "MIT"
+license = "CC0-1.0"
 repository = "https://github.com/linsomniac/xsync"
 homepage = "https://github.com/linsomniac/xsync"
 

@@ -4,12 +4,13 @@ Status: implemented release candidate for protocol 1.0
 
 ## 1. Purpose and scope
 
-`xsync` synchronizes one or more directory trees between the machine on which it
-is invoked and a machine reached through SSH. A single SSH connection is reused
-for all directory jobs. In the default bidirectional mode, the copy with the
-newer modification time wins. Unlike mirroring tools, xsync never infers a
+`xsync` synchronizes one or more filesystem paths between the machine on which
+it is invoked and a machine reached through SSH. A path may be one regular file,
+one symbolic link, or a directory tree. A single SSH connection is reused for
+all jobs. In the default bidirectional mode, the copy with the
+newer modification time wins. In bidirectional mode, xsync never infers a
 deletion from absence: an entry present on only one side is copied to the other
-side.
+side. A one-way job may explicitly opt into receiver mirroring with `--delete`.
 
 The first release targets Unix hosts and regular files, directories, and
 symbolic links. It preserves file modes and mtimes. Ownership preservation is
@@ -31,7 +32,7 @@ plans work, performs it, and exits.
 ## 2. Command line
 
 ```text
-xsync SERVER [GLOBAL_OPTIONS] DIR [DIRECTORY_OPTIONS] [DIR [DIRECTORY_OPTIONS] ...]
+xsync SERVER [GLOBAL_OPTIONS] PATH [PATH_OPTIONS] [PATH [PATH_OPTIONS] ...]
 xsync --agent
 ```
 
@@ -39,7 +40,7 @@ xsync --agent
 standard input and output carry framed protocol data; diagnostics go to standard
 error. Users do not invoke it directly.
 
-Global options must precede the first directory:
+Global options must precede the first path:
 
 - `--in-out` selects bidirectional synchronization and is the default.
 - `--in` permits only remote-to-local transfers.
@@ -65,33 +66,44 @@ Global options must precede the first directory:
   refusal but not the warning.
 - `--owner` and `--group` preserve the corresponding owner by name when
   possible. `--numeric-ids` makes those options use numeric IDs directly.
+- `-a` / `--archive` is exactly shorthand for `--owner --group`. Recursion,
+  mode, mtime, and symlink handling are already baseline behavior; this alias
+  does not add rsync's ACL, xattr, hard-link, device, or special-file features.
 - `--verbose` may be repeated; `--quiet` suppresses non-error summaries.
 
-Direction may also occur in a directory option group and overrides the global
-direction for that job. Directory options apply to the immediately preceding
-`DIR` until the next positional directory:
+Direction may also occur in a path option group and overrides the global
+direction for that job. Path options apply to the immediately preceding `PATH`
+until the next positional path:
 
-- `--dest PATH` sets that directory's remote root. Its default is exactly the
-  local path spelling after local lexical normalization.
+- `--dest PATH` sets that job's exact remote root. Its default is exactly the
+  local path spelling after local lexical normalization. For a file or symlink
+  root, it is the destination filename, not a containing directory; therefore
+  `--dest` may rename a selected entry.
 - `--exclude PATTERN` may be repeated. Patterns use gitignore-like syntax and
   `/` separators, are rooted at the job root when beginning with `/`, and apply
   identically on both peers. Version 1 supports `*`, `?`, character classes,
   `**`, a leading `/`, and a trailing `/` for directory-only matching. It does
   not read ignore files or support `!` negation. Excluding a directory excludes
-  its subtree.
+  its subtree. An explicitly selected file or symlink is the job root and is not
+  filtered by excludes.
+- `--delete` deletes receiver-only entries after successful non-delete work.
+  It is valid only when that path's effective direction is exactly `--in` or
+  `--out`; `--delete` with `--in-out` is a usage error. It applies only below a
+  directory job root. The job root is never deleted, a missing sending root
+  remains an error, and the flag has no additional effect on a direct file or
+  symlink root.
 - `--in`, `--out`, and `--in-out` override the global direction.
 
-`--` ends option interpretation and every following token is a directory path;
-no directory options can follow it. `--dir PATH` is the repeatable explicit form
-for a path beginning with `-` and starts a normal directory option group.
-Unknown options, a directory option before any
-directory, incompatible directions, an empty SSH command, or duplicate `--dest`
+`--` ends option interpretation and every following token is a path; no path
+options can follow it. `--dir PATH` is the repeatable explicit form for a path
+beginning with `-` and starts a normal path option group. Unknown options, a
+path option before any path, incompatible directions, an empty SSH command, or duplicate `--dest`
 are usage errors. Local and destination job roots must be absolute after
 normalization and must not overlap another root on their respective side. A
 relative local path is made absolute using the controller's current directory
 without resolving symlinks; that absolute spelling is also the default remote
 destination. Relative `--dest` is rejected. `--help` and `--version` exit 0; a
-server without a directory exits 2. The custom grouping parser is covered by
+server without a path exits 2. The custom grouping parser is covered by
 table-driven tests.
 
 Examples:
@@ -100,6 +112,8 @@ Examples:
 xsync host.example /home/me/src --exclude target --exclude .git
 xsync backup --out /srv/photos --dest /data/photos /etc --dest /archive/etc
 xsync laptop --progress=json /home/me/notes --in-out
+xsync backup --out /tmp/package.deb --dest /srv/incoming/package.deb
+xsync backup --out /srv/published --dest /srv/mirror --delete
 ```
 
 ## 3. Terminology and architecture
@@ -118,15 +132,15 @@ receiver operations atomically, and remains alive for subsequent jobs.
 controller                       agent
     |---- Hello ------------------->|
     |<--- HelloAck -----------------|
-    |---- BeginJob ---------------->|
-    |<--- JobAccepted --------------|
+    |---- BeginPathJob ------------>|
+    |<--- PathJobAccepted ----------|
     |---- ManifestRequest --------->|
     |<--- Manifest chunks ----------|
     |  scan local; build plan         |
     |<=== entry operations =========>|
     |---- FinishJob ---------------->|
     |<--- JobResult -----------------|
-    |       repeat BeginJob ...       |
+    |       repeat path job ...        |
     |---- EndSession -------------->|
     |<--- Goodbye -------------------|
 ```
@@ -212,11 +226,23 @@ AwaitHello -> Idle -> Accepted -> Inventoried -> Syncing
            -> Finalizing -> Idle -> ... -> Closed
 ```
 
-`BeginJob` is valid only in `Idle`; it carries a job ID, the remote root, excludes,
-direction (for validation/diagnostics), dry-run flag, and negotiated limits.
-One job is active at a time. `BeginJob` opens or creates the root and enters
-`Accepted`; `ManifestRequest` inventories it and enters `Inventoried`; the first
-entry operation enters `Syncing`. `Syncing` is skipped for an empty plan.
+`BeginPathJob` is valid only in `Idle`; it carries a job ID, the remote root,
+the local root intent (`Directory`, `Entry`, or `Auto`), excludes, direction,
+dry-run flag, and preservation policy. An existing remote object always
+determines its actual root kind. The intent determines only how a missing
+writable remote root is represented. `PathJobAccepted` returns the selected
+remote kind. `FEATURE_FILE_ROOT` negotiates these messages; the legacy
+`BeginJob`/`JobAccepted` directory-only pair remains available when the feature
+is absent. A controller rejects file and `Auto` jobs before beginning any job
+when the endpoint lacks this feature.
+For a delete job, `BeginPathJob` also carries a job-bound delete authorization.
+The field is omitted when false for compatibility with earlier path-root
+endpoints. `FEATURE_DELETE` is required before any job begins; the legacy
+`BeginJob` form can never authorize deletion.
+
+One job is active at a time. Beginning a job opens or creates its root and
+enters `Accepted`; `ManifestRequest` inventories it and enters `Inventoried`;
+the first entry operation enters `Syncing`. `Syncing` is skipped for an empty plan.
 `FinishJob` enters
 `Finalizing` and `JobResult` returns to `Idle`. The controller may send
 `AbortJob` only between streams. On cancellation during a response stream, the
@@ -226,13 +252,17 @@ stream, the agent drains it before an abort can be sent. The agent then replies
 edge. Framing, handshake, and state-machine errors are session-fatal.
 `EndSession` is valid only in `Idle`.
 
-If a requested root is missing and direction permits writes to that peer, xsync
-creates the root (but not missing ancestors) with temporary mode `0700` and
-later finalizes it from the source root metadata. The root's creation metadata is
-provisional and the empty-path manifest entry participates in the same final
-deepest-first directory pass. It reports `RootParentMissing` when
-the parent is absent. A missing root on a read-only side fails the job. Dry-run
-reports but does not perform root creation.
+If a requested directory root is missing and direction permits writes to that
+peer, xsync creates the root (but not missing ancestors) with temporary mode
+`0700` and later finalizes it from the source root metadata. The root's creation
+metadata is provisional and the empty-path manifest entry participates in the
+same final deepest-first directory pass. A missing selected-entry receiver
+opens, shared-locks, and retains its existing parent capability but leaves the
+target absent until atomic file or symlink commit; it never calls `mkdir` for the target.
+Missing parents are not created. A missing root on a read-only side fails the job. Dry-run reports but
+does not create either root kind. When the local root is absent, `Auto` adopts an
+existing remote kind; if both sides are absent in `in-out`, legacy directory
+behavior is retained rather than inferring a file from its name.
 
 ### 4.4 Normative message catalog
 
@@ -249,6 +279,7 @@ stream always ends before its response stream begins.
 | Session | `HelloAck` A→C / `Incompatible` A→C | handshake response; selected version/features/limits or supported range/reason, echoed stamp and agent wall nanoseconds |
 | Session | `EndSession` C→A / `Goodbye` A→C | `Idle`; empty request and summary response |
 | Job | `BeginJob` C→A / `JobAccepted` A→C | `Idle`→`Accepted`; absolute remote-root bytes, direction, excludes, dry-run and preservation flags |
+| Job | `BeginPathJob` C→A / `PathJobAccepted` A→C | negotiated `FEATURE_FILE_ROOT`; legacy payload plus `Directory`/`Entry`/`Auto` intent and optional job-bound delete authorization, with the agent returning the actual `Directory`/`Entry` kind |
 | Job | `FinishJob` C→A / `JobResult` A→C | `Inventoried` or `Syncing`→`Finalizing`→`Idle`; transfer/warning/error counters |
 | Job | `AbortJob` C→A / `JobAborted` A→C | between streams in an active job; reason and cleanup result |
 | Inventory | `ManifestRequest` C→A | `Accepted`; A→C `StreamStart`, bounded `ManifestChunk` frames, then `StreamEnd`; success enters `Inventoried` |
@@ -258,6 +289,8 @@ stream always ends before its response stream begins.
 | Remote source | `DeltaRequestStart` C→A | path, planned source, block size and signature count; C→A `SignatureChunk` frames and `StreamEnd`; A→C `DeltaStart`; C→A `DeltaProceed(true)` followed by A→C `InstructionChunk` frames and `DeltaEnd`, or `DeltaProceed(false)` followed by `DeltaCancelled` |
 | Symlink source | `SymlinkSourceRequest` C→A / `SymlinkSourceResponse` A→C | planned source identity and target bytes |
 | Non-file receiver | `ApplyDirectory`, `ApplySymlink`, `FinalizeDirectory` C→A | validated entry metadata and planned destination identity; `ApplyResult` A→C |
+| Delete receiver | `DeleteEntry` C→A | negotiated `FEATURE_DELETE`; `Inventoried`/`Syncing`, authorized one-way `Out` job, non-root receiver-manifest entry and exact planned fingerprint; `ApplyResult` A→C |
+| Delete source | `ValidateAbsent` C→A | negotiated `FEATURE_DELETE`; `Inventoried`/`Syncing`, authorized one-way `In` job and non-root path absent from the retained sender manifest; revalidates absence and returns `ApplyResult` |
 | Control | `Error` A→C | bounded structured class/path/message; fatal flag controls session teardown |
 
 Chunk arrays contain at most 256 records and must also fit the negotiated frame.
@@ -277,21 +310,31 @@ Every manifest entry contains a root-relative byte path and:
 - regular-file length;
 - symlink target bytes;
 
-The root itself is represented by the empty relative path. Entries are emitted
-in bytewise path order for deterministic plans and tests. Scanning uses
+The root itself is represented by the empty relative path. A directory-root
+manifest has a directory at that path plus normal descendants. An entry-root
+manifest is either empty for a missing target or contains exactly one regular
+file, symlink, or unsupported entry at that path; it can never contain children
+or directory operations. The root shape is validated against the kind selected
+during job acceptance. Entries are emitted in bytewise path order for
+deterministic plans and tests. Scanning uses
 `symlink_metadata`; symlinks are recorded and never traversed. A relative entry
 must be normalized, contain no empty, `.` or `..` component, contain no NUL, and
-must not be absolute. Both peers independently apply the same excludes.
+must not be absolute. Both peers independently apply the same excludes beneath
+directory roots; explicit entry roots are never filtered.
 Manifest entries do not carry content digests. With `--checksum`, after
 comparing manifests the controller uses bounded, chunked
 `DigestRequest`/`DigestResponse` exchanges only for ambiguous paths.
 
 The absolute job-root spelling may contain symlinks above its final component.
-The root is resolved and opened once, its identity is recorded, and subsequent
-work is relative to that directory capability. The final root component must be
-a directory. Receiver mutations are confined beneath it. Operations reject an
-ancestor below the opened root that is a symlink. Temporary names are created in the destination
-entry's parent with exclusive creation. This prevents protocol paths and a
+A directory root is resolved and opened once as a directory capability. A
+selected-entry root instead opens its parent capability without following the
+final component and retains the exact basename and its expected identity or
+absence. The reserved `.xsync.tmp.` and `.xsync.recovery.` prefixes cannot be
+selected as job roots.
+Receiver mutations are confined to the opened capability. Operations reject an
+ancestor below an opened directory root that is a symlink, and entry-root
+operations reject all non-root protocol paths. Temporary names are created in
+the destination entry's parent with exclusive creation. This prevents protocol paths and a
 concurrent symlink swap from redirecting writes outside the root. Version 1 is
 designed for non-hostile trees but still performs these containment checks at
 each mutation boundary.
@@ -304,7 +347,9 @@ removes known temporaries, while stale crash debris remains ignored. Before an
 existing destination is atomically exchanged, the prepared payload is renamed
 to a visible `.xsync.recovery.` name. Consequently, an abrupt process death can
 leave an obvious recovery file but cannot hide independently written data under
-the scanner-pruned temp prefix.
+the scanner-pruned temp prefix. Scans expose every `.xsync.recovery.*` name as
+an unsupported inventory barrier before evaluating user excludes. It is never
+copied or automatically deleted; the operator must inspect and resolve it.
 
 A source file is fingerprinted with device, inode, kind, size, and mtime and is
 restatted before and after reading. The destination is likewise fingerprinted at
@@ -312,13 +357,23 @@ planning and revalidated immediately before commit. Any change causes
 `SourceChanged` or `DestinationChanged`; an inconsistent source is never
 committed and an independently changed destination is never overwritten.
 
-Both peers acquire non-blocking advisory locks on their opened root directories
-before inventory and hold them through finalization. A busy root fails clearly;
-there is no distributed wait and therefore no lock-order deadlock.
+Both peers acquire non-blocking advisory locks before inventory and hold them
+through finalization. Directory roots take an exclusive lock on the opened root;
+selected-entry roots take a shared lock on the opened parent. Multiple entry
+jobs for unrelated names in one parent can proceed concurrently, while a
+directory job and a direct child-entry job exclude each other so directory
+inventory and final metadata cannot race an entry commit. Target fingerprints,
+`NOREPLACE` creation, and exchange rollback still arbitrate concurrent writers
+to the same entry. A busy root fails clearly; there is no distributed wait and
+therefore no lock-order deadlock.
 
 ## 6. Planning and conflict policy
 
 Planning is deterministic over the union of relative paths.
+
+If one job root is a selected entry and the other is a directory, the empty-path
+kind collision is a structural conflict. It blocks all directory descendants,
+and neither the selected entry nor the directory tree is modified.
 
 When an entry exists on only one side:
 
@@ -326,7 +381,18 @@ When an entry exists on only one side:
 - `out`: copy local-only entries outward; leave remote-only entries untouched;
 - `in`: copy remote-only entries inward; leave local-only entries untouched.
 
-No mode deletes an entry merely because it is absent on the other side.
+Without `--delete`, no mode deletes an entry merely because it is absent on the
+other side. With `--delete` in `out`, a remote-only descendant is deleted; with
+`--delete` in `in`, a local-only descendant is deleted. Entry-kind collisions
+remain conflicts rather than implicit replacements. Excludes remove paths from
+both inventories and therefore protect those entries from direct deletion. The
+delete planner tests each path against both file and directory interpretations,
+so a trailing-slash directory pattern also protects a receiver file of the same
+name when the sender has an excluded directory.
+Unsupported or unreadable entries are inventory barriers. The barrier and its
+subtree are protected from deletion so a partial sender view cannot erase valid
+receiver data; independent paths may still be reconciled. Conflicts do not
+suppress unrelated deletes.
 
 Mtime comparisons use the requested modify window. When both sides contain the
 same kind:
@@ -356,10 +422,43 @@ ordering. A future explicit conflict policy can add alternatives without
 changing version 1's safe default.
 
 The complete plan is stable-sorted: create required directories shallowest
-first, transfer/symlink entries bytewise by path, and finalize directory
-metadata deepest first. If a parent path has a structural conflict, descendants
+first, transfer/symlink entries bytewise by path, delete entries deepest first,
+and finalize directory metadata deepest first. Destructive work begins only
+after all non-delete mutations. Any preceding mutation or deletion error
+suppresses the remaining deletes. A directory scheduled for deletion also has
+a conditional finalizer: it is skipped after successful removal, but restores
+the original receiver metadata when a non-recursive removal fails and the
+directory survives. If a parent path has a structural conflict, descendants
 beneath it are blocked and reported once. Metadata-only divergence never blocks
 descendants.
+
+### 6.1 Deletion safety
+
+Deletion is explicitly negotiated and authorized per job. The receiver accepts
+only a non-root file, symlink, or directory that exactly matches its retained
+manifest entry. Immediately before each delete, the sender revalidates that the
+path is still absent: the controller checks locally for `out`, while
+`ValidateAbsent` asks the agent for `in`. Cross-machine atomicity is impossible,
+so a sender can still create the path after this check; deletion therefore uses
+the closest practical absence validation rather than claiming a distributed
+transaction.
+
+The receiver first validates the planned identity. Before staging a directory,
+it opens the exact directory without following symlinks, verifies its identity,
+and probes for children. A nonempty directory is retained with a warning; this
+is the ordinary outcome when an excluded descendant is present and does not
+suppress independent deletes. Otherwise the receiver renames the target with
+`NOREPLACE` to a unique visible recovery name in the same parent, and verifies
+the moved identity. Files and symlinks require the full planned fingerprint;
+directories use kind/device/inode because planned child deletions legitimately
+change directory size and mtime. Files and symlinks are then unlinked and
+directories are removed only with non-recursive `rmdir`. On mismatch or removal
+failure (including a child created after the emptiness probe), xsync restores
+the recovery name with `NOREPLACE`; if the original name
+was concurrently occupied, it retains the recovery artifact and reports the
+race. An excluded or concurrently created descendant therefore makes `rmdir`
+fail closed rather than enabling recursive data loss. Job roots are never
+deletion targets.
 
 ## 7. Delta transfer
 
@@ -426,6 +525,7 @@ available and otherwise fall back to numeric IDs. Ownership is applied before
 final mode because `chown` may clear special bits. Permission failure produces
 a structured warning and does not invalidate correct file content. Symlink
 ownership/mtime operations use no-follow APIs.
+`-a` / `--archive` selects both ownership flags and has no other metadata effect.
 
 ## 9. Progress, diagnostics, and exit status
 
@@ -443,7 +543,7 @@ progress modes. `json` emits versioned JSON Lines with `session_start`,
 `entry_done`, `planned_operation`, `warning`, `conflict`, `job_error`, `job_done`,
 `clock_skew_warning`, `remote_diagnostic`, terminal `error`, and
 `session_done`. Transfer directions are consistently `local-to-remote` or
-`remote-to-local`. Paths
+`remote-to-local`; deletion events use `delete-local` or `delete-remote`. Paths
 include a display string and a lossless base64 form when needed. Secrets and the
 full SSH command environment are never printed.
 JSON progress is also written to stderr.
@@ -515,7 +615,8 @@ always yields the new bytes and digest, including repeated blocks and boundary
 sizes. Malformed-frame and malformed-delta tests assert bounded clean failures.
 
 Filesystem integration tests use temporary roots to cover bidirectional newer
-wins, all one-sided cases, direction filtering, no deletion, conflicts, nested
+wins, all one-sided cases, direction filtering, default no-deletion and explicit
+one-way deletion, conflicts, nested
 directories, excludes, permissions, mtimes, symlinks, non-UTF-8 paths, atomic
 replacement, interrupted transfers, and source/basis races where injectable
 hooks permit deterministic simulation.
@@ -528,6 +629,9 @@ connection reuse, both transfer directions, delta reuse, progress modes,
 remote errors, reduced negotiated frames, warnings/exit statuses, partial-data
 interruption cleanup, and premature transport death without requiring SSH
 credentials.
+Delete acceptance covers both directions, dry-run, excluded descendants,
+protected recovery artifacts, non-recursive rollback, endpoint feature refusal
+before mutation, receiver fingerprints, and sender absence checks.
 
 Release acceptance requires `cargo fmt --check`, strict `cargo clippy`, all unit
 and integration tests, and successful debug and release builds.

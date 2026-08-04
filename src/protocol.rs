@@ -21,7 +21,23 @@ pub const MAX_TRANSFER_MEMORY: u64 = 512 * 1024 * 1024;
 pub const FEATURE_DELTA: u64 = 1 << 0;
 pub const FEATURE_CHECKSUM: u64 = 1 << 1;
 pub const FEATURE_OWNERSHIP: u64 = 1 << 2;
-pub const SUPPORTED_FEATURES: u64 = FEATURE_DELTA | FEATURE_CHECKSUM | FEATURE_OWNERSHIP;
+pub const FEATURE_FILE_ROOT: u64 = 1 << 3;
+pub const FEATURE_DELETE: u64 = 1 << 4;
+pub const SUPPORTED_FEATURES: u64 =
+    FEATURE_DELTA | FEATURE_CHECKSUM | FEATURE_OWNERSHIP | FEATURE_FILE_ROOT | FEATURE_DELETE;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PathRootRequest {
+    Directory,
+    Entry,
+    Auto,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum JobRootKind {
+    Directory,
+    Entry,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Limits {
@@ -135,6 +151,21 @@ pub enum Message {
         numeric_ids: bool,
     },
     JobAccepted,
+    BeginPathJob {
+        #[serde(with = "serde_bytes")]
+        root: Vec<u8>,
+        root_request: PathRootRequest,
+        direction: Direction,
+        excludes: Vec<String>,
+        dry_run: bool,
+        preserve_owner: bool,
+        preserve_group: bool,
+        numeric_ids: bool,
+        delete: bool,
+    },
+    PathJobAccepted {
+        root_kind: JobRootKind,
+    },
     ManifestRequest,
     ManifestChunk(Vec<ManifestEntry>),
     DigestRequest(Vec<RelativePath>),
@@ -189,6 +220,12 @@ pub enum Message {
     FinalizeDirectory {
         entry: ManifestEntry,
         expected_destination: Fingerprint,
+    },
+    DeleteEntry {
+        entry: ManifestEntry,
+    },
+    ValidateAbsent {
+        path: RelativePath,
     },
     FinishJob,
     JobResult(JobSummary),
@@ -509,6 +546,38 @@ fn encode_message(message: &Message) -> Result<(u16, Value)> {
             ]),
         ),
         Message::JobAccepted => (11, empty()),
+        Message::BeginPathJob {
+            root,
+            root_request,
+            direction,
+            excludes,
+            dry_run,
+            preserve_owner,
+            preserve_group,
+            numeric_ids,
+            delete,
+        } => {
+            let mut fields = vec![
+                (0, Value::Bytes(root.clone())),
+                (1, Value::from(path_root_request_code(*root_request))),
+                (2, Value::from(direction_code(*direction))),
+                (3, serialized(excludes)?),
+                (4, serialized(dry_run)?),
+                (5, serialized(preserve_owner)?),
+                (6, serialized(preserve_group)?),
+                (7, serialized(numeric_ids)?),
+            ];
+            // Omit the false value so non-delete jobs retain byte-level
+            // compatibility with endpoints that predate FEATURE_DELETE.
+            if *delete {
+                fields.push((8, serialized(delete)?));
+            }
+            (12, integer_map_vec(fields))
+        }
+        Message::PathJobAccepted { root_kind } => (
+            13,
+            integer_map([(0, Value::from(job_root_kind_code(*root_kind)))]),
+        ),
         Message::ManifestRequest => (20, empty()),
         Message::ManifestChunk(entries) => (21, integer_map([(0, serialized(entries)?)])),
         Message::DigestRequest(paths) => (22, integer_map([(0, serialized(paths)?)])),
@@ -616,6 +685,8 @@ fn encode_message(message: &Message) -> Result<(u16, Value)> {
                 (1, serialized(expected_destination)?),
             ]),
         ),
+        Message::DeleteEntry { entry } => (44, integer_map([(0, serialized(entry)?)])),
+        Message::ValidateAbsent { path } => (48, integer_map([(0, serialized(path)?)])),
         Message::FinishJob => (50, empty()),
         Message::JobResult(summary) => (51, integer_map([(0, serialized(summary)?)])),
         Message::AbortJob { reason } => (52, integer_map([(0, serialized(reason)?)])),
@@ -682,6 +753,20 @@ fn decode_message(kind: u16, payload: Value) -> Result<Message> {
             numeric_ids: fields.take(6)?,
         },
         11 => Message::JobAccepted,
+        12 => Message::BeginPathJob {
+            root: take_bytes(&mut fields, 0)?,
+            root_request: decode_path_root_request(fields.take(1)?)?,
+            direction: decode_direction(fields.take(2)?)?,
+            excludes: fields.take(3)?,
+            dry_run: fields.take(4)?,
+            preserve_owner: fields.take(5)?,
+            preserve_group: fields.take(6)?,
+            numeric_ids: fields.take(7)?,
+            delete: fields.take_optional(8)?.unwrap_or(false),
+        },
+        13 => Message::PathJobAccepted {
+            root_kind: decode_job_root_kind(fields.take(0)?)?,
+        },
         20 => Message::ManifestRequest,
         21 => Message::ManifestChunk(fields.take(0)?),
         22 => Message::DigestRequest(fields.take(0)?),
@@ -735,6 +820,12 @@ fn decode_message(kind: u16, payload: Value) -> Result<Message> {
         },
         43 => Message::SymlinkSourceResponse {
             target: take_bytes(&mut fields, 0)?,
+        },
+        44 => Message::DeleteEntry {
+            entry: fields.take(0)?,
+        },
+        48 => Message::ValidateAbsent {
+            path: fields.take(0)?,
         },
         50 => Message::FinishJob,
         51 => Message::JobResult(fields.take(0)?),
@@ -863,6 +954,22 @@ fn validate_message(message: &Message) -> Result<()> {
                 crate::manifest::EntryKind::Symlink,
             )?;
         }
+        Message::DeleteEntry { entry } => {
+            entry.validate()?;
+            if entry.path.is_root()
+                || !matches!(
+                    entry.kind,
+                    crate::manifest::EntryKind::File
+                        | crate::manifest::EntryKind::Directory
+                        | crate::manifest::EntryKind::Symlink
+                )
+            {
+                return Err(Error::Protocol("invalid delete entry".into()));
+            }
+        }
+        Message::ValidateAbsent { path } if path.is_root() => {
+            return Err(Error::Protocol("cannot validate job-root absence".into()));
+        }
         Message::SignatureRequest {
             expected: Some(fingerprint),
             ..
@@ -927,6 +1034,15 @@ fn validate_fingerprint(fingerprint: &Fingerprint, kind: crate::manifest::EntryK
 }
 
 fn integer_map<const N: usize>(fields: [(u16, Value); N]) -> Value {
+    Value::Map(
+        fields
+            .into_iter()
+            .map(|(key, value)| (Value::from(key), value))
+            .collect(),
+    )
+}
+
+fn integer_map_vec(fields: Vec<(u16, Value)>) -> Value {
     Value::Map(
         fields
             .into_iter()
@@ -1003,6 +1119,17 @@ impl Fields {
             .map_err(|error| Error::Protocol(format!("invalid message field {key}: {error}")))
     }
 
+    fn take_optional<T: DeserializeOwned>(&mut self, key: u16) -> Result<Option<T>> {
+        self.0
+            .remove(&key)
+            .map(|value| {
+                value.deserialized().map_err(|error| {
+                    Error::Protocol(format!("invalid message field {key}: {error}"))
+                })
+            })
+            .transpose()
+    }
+
     fn take_value(&mut self, key: u16) -> Result<Value> {
         self.0
             .remove(&key)
@@ -1049,6 +1176,38 @@ fn decode_direction(code: u8) -> Result<Direction> {
         1 => Ok(Direction::In),
         2 => Ok(Direction::Out),
         _ => Err(Error::Protocol("invalid direction code".into())),
+    }
+}
+
+const fn path_root_request_code(request: PathRootRequest) -> u8 {
+    match request {
+        PathRootRequest::Directory => 0,
+        PathRootRequest::Entry => 1,
+        PathRootRequest::Auto => 2,
+    }
+}
+
+fn decode_path_root_request(code: u8) -> Result<PathRootRequest> {
+    match code {
+        0 => Ok(PathRootRequest::Directory),
+        1 => Ok(PathRootRequest::Entry),
+        2 => Ok(PathRootRequest::Auto),
+        _ => Err(Error::Protocol("invalid path root request code".into())),
+    }
+}
+
+const fn job_root_kind_code(kind: JobRootKind) -> u8 {
+    match kind {
+        JobRootKind::Directory => 0,
+        JobRootKind::Entry => 1,
+    }
+}
+
+fn decode_job_root_kind(code: u8) -> Result<JobRootKind> {
+    match code {
+        0 => Ok(JobRootKind::Directory),
+        1 => Ok(JobRootKind::Entry),
+        _ => Err(Error::Protocol("invalid job root kind code".into())),
     }
 }
 
@@ -1257,6 +1416,20 @@ mod tests {
                 numeric_ids: false,
             },
             Message::JobAccepted,
+            Message::BeginPathJob {
+                root: b"file".to_vec(),
+                root_request: PathRootRequest::Entry,
+                direction: Direction::Out,
+                excludes: Vec::new(),
+                dry_run: true,
+                preserve_owner: false,
+                preserve_group: false,
+                numeric_ids: false,
+                delete: true,
+            },
+            Message::PathJobAccepted {
+                root_kind: JobRootKind::Entry,
+            },
             Message::ManifestRequest,
             Message::ManifestChunk(vec![file.clone()]),
             Message::DigestRequest(vec![file.path.clone()]),
@@ -1315,6 +1488,12 @@ mod tests {
                 entry: directory.clone(),
                 expected_destination: directory.fingerprint,
             },
+            Message::DeleteEntry {
+                entry: directory.clone(),
+            },
+            Message::ValidateAbsent {
+                path: file.path.clone(),
+            },
             Message::FinishJob,
             Message::JobResult(JobSummary::default()),
             Message::AbortJob {
@@ -1358,6 +1537,27 @@ mod tests {
             assert!(kinds.insert(format!("{kind:?}")), "duplicate message kind");
             assert_eq!(decode_envelope(encoded).unwrap(), envelope);
         }
+    }
+
+    #[test]
+    fn false_delete_job_field_is_omitted_for_older_path_root_endpoints() {
+        let message = Message::BeginPathJob {
+            root: b"/directory".to_vec(),
+            root_request: PathRootRequest::Directory,
+            direction: Direction::Out,
+            excludes: Vec::new(),
+            dry_run: false,
+            preserve_owner: false,
+            preserve_group: false,
+            numeric_ids: false,
+            delete: false,
+        };
+        let (kind, payload) = encode_message(&message).unwrap();
+        let Value::Map(fields) = &payload else {
+            panic!("path job payload was not a map");
+        };
+        assert!(!fields.iter().any(|(key, _)| key == &Value::from(8)));
+        assert_eq!(decode_message(kind, payload).unwrap(), message);
     }
 
     #[test]

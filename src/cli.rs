@@ -47,6 +47,7 @@ pub struct JobConfig {
     pub remote: PathBuf,
     pub direction: Direction,
     pub excludes: Vec<String>,
+    pub delete: bool,
     dest_explicit: bool,
     direction_explicit: bool,
 }
@@ -178,11 +179,12 @@ pub fn parse(args: Vec<OsString>, cwd: PathBuf) -> Result<Invocation> {
                     job.excludes
                         .push(text_value(value, "--exclude pattern")?.to_owned());
                 }
+                "--delete" => job.delete = true,
                 "--in" => set_job_direction(job, Direction::In)?,
                 "--out" => set_job_direction(job, Direction::Out)?,
                 "--in-out" => set_job_direction(job, Direction::InOut)?,
                 _ => {
-                    return Err(Error::Usage(format!("unknown directory option {arg_text}")));
+                    return Err(Error::Usage(format!("unknown path option {arg_text}")));
                 }
             }
             index += 1;
@@ -213,6 +215,10 @@ pub fn parse(args: Vec<OsString>, cwd: PathBuf) -> Result<Invocation> {
             "--ignore-clock-skew" => ignore_clock_skew = true,
             "--owner" => preserve_owner = true,
             "--group" => preserve_group = true,
+            "--archive" | "-a" => {
+                preserve_owner = true;
+                preserve_group = true;
+            }
             "--numeric-ids" => numeric_ids = true,
             "--verbose" | "-v" => verbose = verbose.saturating_add(1),
             "--quiet" | "-q" => quiet = true,
@@ -257,13 +263,16 @@ pub fn parse(args: Vec<OsString>, cwd: PathBuf) -> Result<Invocation> {
     }
     push_job(&mut current, &mut jobs);
     if jobs.is_empty() {
-        return Err(Error::Usage(
-            "SERVER requires at least one directory".into(),
-        ));
+        return Err(Error::Usage("SERVER requires at least one path".into()));
     }
     validate_no_overlap(&jobs)?;
     for job in &jobs {
         Excludes::compile(&job.excludes)?;
+        if job.delete && job.direction == Direction::InOut {
+            return Err(Error::Usage(
+                "--delete requires --in or --out for that path".into(),
+            ));
+        }
     }
     if numeric_ids && !(preserve_owner || preserve_group) {
         return Err(Error::Usage(
@@ -309,6 +318,7 @@ fn new_job(value: &OsStr, direction: Direction, cwd: &std::path::Path) -> Result
         local,
         direction,
         excludes: Vec::new(),
+        delete: false,
         dest_explicit: false,
         direction_explicit: false,
     })
@@ -322,7 +332,7 @@ fn text_value<'a>(value: &'a OsStr, description: &str) -> Result<&'a str> {
 
 fn set_job_direction(job: &mut JobConfig, value: Direction) -> Result<()> {
     let mut explicit = job.direction_explicit;
-    set_direction(&mut job.direction, &mut explicit, value, "directory")?;
+    set_direction(&mut job.direction, &mut explicit, value, "path")?;
     job.direction_explicit = explicit;
     Ok(())
 }
@@ -373,11 +383,11 @@ fn validate_no_overlap(jobs: &[JobConfig]) -> Result<()> {
 
 #[must_use]
 pub fn help() -> &'static str {
-    "xsync - stateless bidirectional directory synchronization\n\n\
-Usage:\n  xsync SERVER [GLOBAL_OPTIONS] DIR [DIRECTORY_OPTIONS]...\n  xsync --agent\n\n\
-Global options (before the first directory):\n  --in | --out | --in-out       Allowed transfer direction (default: in-out)\n  --ssh COMMAND                 SSH command (default: ssh)\n  --remote-program PATH         Remote xsync executable (default: xsync)\n  --progress[=MODE]             auto, always, never, or json\n  -n, --dry-run                 Show planned changes without modifying files\n  --checksum                    Hash metadata-equal files\n  --modify-window SECONDS       Mtime equality window (default: 0)\n  --max-clock-skew SECONDS      Refuse unsafe clock skew (default: 60)\n  --ignore-clock-skew           Warn but do not refuse for clock skew\n  --owner --group --numeric-ids Ownership preservation controls\n  -v, --verbose | -q, --quiet   Diagnostic verbosity\n  --dir PATH                    Explicit directory (including leading '-')\n\n\
-Directory options:\n  --dest ABSOLUTE_PATH          Override the remote root\n  --exclude PATTERN             Repeatable symmetric exclusion\n  --in | --out | --in-out       Override direction for this directory\n\n\
-Absence never implies deletion. Equal-time divergent files are conflicts.\n"
+    "xsync - stateless bidirectional file and directory synchronization\n\n\
+Usage:\n  xsync SERVER [GLOBAL_OPTIONS] PATH [PATH_OPTIONS]...\n  xsync --agent\n\n\
+Global options (before the first path):\n  --in | --out | --in-out       Allowed transfer direction (default: in-out)\n  --ssh COMMAND                 SSH command (default: ssh)\n  --remote-program PATH         Remote xsync executable (default: xsync)\n  --progress[=MODE]             auto, always, never, or json\n  -n, --dry-run                 Show planned changes without modifying files\n  --checksum                    Hash metadata-equal files\n  --modify-window SECONDS       Mtime equality window (default: 0)\n  --max-clock-skew SECONDS      Refuse unsafe clock skew (default: 60)\n  --ignore-clock-skew           Warn but do not refuse for clock skew\n  -a, --archive                 Equivalent to --owner --group\n  --owner --group --numeric-ids Ownership preservation controls\n  -v, --verbose | -q, --quiet   Diagnostic verbosity\n  --dir PATH                    Explicit path (including leading '-')\n\n\
+Path options:\n  --dest ABSOLUTE_PATH          Override the exact remote root path\n  --exclude PATTERN             Repeatable symmetric directory exclusion\n  --delete                      Delete receiver-only entries (requires --in or --out)\n  --in | --out | --in-out       Override direction for this path\n\n\
+Absence implies deletion only with --delete in a one-way directory job.\nEqual-time divergent files are conflicts.\n"
 }
 
 #[cfg(test)]
@@ -523,6 +533,37 @@ mod tests {
     #[test]
     fn parses_short_dry_run_option() {
         assert!(run(&["host", "-n", "/data"]).dry_run);
+    }
+
+    #[test]
+    fn archive_enables_owner_and_group_preservation() {
+        for option in ["-a", "--archive"] {
+            let config = run(&["host", option, "/data"]);
+            assert!(config.preserve_owner);
+            assert!(config.preserve_group);
+        }
+    }
+
+    #[test]
+    fn delete_is_a_one_way_path_option() {
+        let out = run(&["host", "/data", "--delete", "--out"]);
+        assert!(out.jobs[0].delete);
+        assert_eq!(out.jobs[0].direction, Direction::Out);
+
+        let inherited = run(&["host", "--in", "/data", "--delete"]);
+        assert!(inherited.jobs[0].delete);
+        assert_eq!(inherited.jobs[0].direction, Direction::In);
+
+        for values in [
+            vec!["host", "/data", "--delete"],
+            vec!["host", "--delete", "/data", "--out"],
+            vec!["host", "--out", "/data", "--delete", "--in-out"],
+        ] {
+            assert!(
+                parse(strings(&values), PathBuf::from("/work")).is_err(),
+                "{values:?}"
+            );
+        }
     }
 
     #[test]

@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     Result,
     cli::Direction,
-    manifest::{EntryKind, Manifest, ManifestEntry},
+    exclude::Excludes,
+    manifest::{EntryKind, Manifest, ManifestEntry, ManifestRootKind},
     path::RelativePath,
 };
 
@@ -22,12 +23,36 @@ pub struct MetadataPolicy {
     pub numeric_ids: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlanningPolicy<'a> {
+    pub metadata: MetadataPolicy,
+    pub delete: bool,
+    pub excludes: Option<&'a Excludes>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
-    CreateDirectory { target: Side, entry: ManifestEntry },
-    TransferFile { source: Side, entry: ManifestEntry },
-    WriteSymlink { source: Side, entry: ManifestEntry },
-    FinalizeDirectory { target: Side, entry: ManifestEntry },
+    CreateDirectory {
+        target: Side,
+        entry: ManifestEntry,
+    },
+    TransferFile {
+        source: Side,
+        entry: ManifestEntry,
+    },
+    WriteSymlink {
+        source: Side,
+        entry: ManifestEntry,
+    },
+    DeleteEntry {
+        target: Side,
+        entry: ManifestEntry,
+    },
+    FinalizeDirectory {
+        target: Side,
+        entry: ManifestEntry,
+        conditional_on_delete_failure: bool,
+    },
 }
 
 impl Operation {
@@ -37,8 +62,20 @@ impl Operation {
             Self::CreateDirectory { entry, .. }
             | Self::TransferFile { entry, .. }
             | Self::WriteSymlink { entry, .. }
+            | Self::DeleteEntry { entry, .. }
             | Self::FinalizeDirectory { entry, .. } => &entry.path,
         }
+    }
+
+    #[must_use]
+    pub const fn is_conditional_delete_finalizer(&self) -> bool {
+        matches!(
+            self,
+            Self::FinalizeDirectory {
+                conditional_on_delete_failure: true,
+                ..
+            }
+        )
     }
 }
 
@@ -113,6 +150,7 @@ impl Plan {
                     Operation::CreateDirectory { entry, .. }
                     | Operation::TransferFile { entry, .. }
                     | Operation::WriteSymlink { entry, .. }
+                    | Operation::DeleteEntry { entry, .. }
                     | Operation::FinalizeDirectory { entry, .. } => entry.estimated_wire_bytes(),
                 })
                 .saturating_add(directory_auxiliary),
@@ -172,7 +210,7 @@ pub fn build_plan(
         direction,
         modify_window_ns,
         digests,
-        MetadataPolicy::default(),
+        PlanningPolicy::default(),
         MAX_PLAN_BYTES,
     )
 }
@@ -183,7 +221,7 @@ pub fn build_plan_with_budget(
     direction: Direction,
     modify_window_ns: i128,
     digests: Option<&Digests>,
-    metadata_policy: MetadataPolicy,
+    policy: PlanningPolicy,
     memory_limit: usize,
 ) -> Result<Plan> {
     local.validate(true)?;
@@ -192,9 +230,20 @@ pub fn build_plan_with_budget(
         memory_limit,
         ..Plan::default()
     };
+    let delete = policy.delete;
+    if delete
+        && (local.root_kind == ManifestRootKind::Entry
+            || remote.root_kind == ManifestRootKind::Entry)
+    {
+        plan.push_warning(
+            RelativePath::root(),
+            "--delete has no effect on a direct file or symlink job; job roots are never deleted"
+                .into(),
+        )?;
+    }
     let mut local_iter = local.entries.iter().peekable();
     let mut remote_iter = remote.entries.iter().peekable();
-    let mut blocked: Option<RelativePath> = None;
+    let mut blocked = BTreeSet::<RelativePath>::new();
     while local_iter.peek().is_some() || remote_iter.peek().is_some() {
         let path = match (local_iter.peek(), remote_iter.peek()) {
             (Some((left, _)), Some((right, _))) => (*left).min(*right).clone(),
@@ -211,13 +260,9 @@ pub fn build_plan_with_budget(
         } else {
             None
         };
-        if blocked
-            .as_ref()
-            .is_some_and(|parent| path.starts_with(parent) && path != *parent)
-        {
+        if has_blocked_ancestor(&blocked, &path) {
             continue;
         }
-        blocked = None;
         if left.is_some_and(|entry| entry.kind == EntryKind::Unsupported)
             || right.is_some_and(|entry| entry.kind == EntryKind::Unsupported)
         {
@@ -226,15 +271,33 @@ pub fn build_plan_with_budget(
                 .or_else(|| right.and_then(|entry| entry.scan_error.as_deref()))
                 .unwrap_or("unsupported file kind");
             plan.push_warning(path.clone(), format!("inventory barrier: {detail}"))?;
-            blocked = Some(path);
+            block_subtree(&mut plan, &mut blocked, path)?;
             continue;
         }
         match (left, right) {
-            (Some(entry), None) => plan_one_sided(&mut plan, Side::Local, entry, direction)?,
-            (None, Some(entry)) => plan_one_sided(&mut plan, Side::Remote, entry, direction)?,
+            (Some(entry), None) => {
+                plan_one_sided(
+                    &mut plan,
+                    Side::Local,
+                    entry,
+                    direction,
+                    delete,
+                    policy.excludes,
+                )?;
+            }
+            (None, Some(entry)) => {
+                plan_one_sided(
+                    &mut plan,
+                    Side::Remote,
+                    entry,
+                    direction,
+                    delete,
+                    policy.excludes,
+                )?;
+            }
             (Some(left), Some(right)) if left.kind != right.kind => {
                 plan.push_conflict(path.clone())?;
-                blocked = Some(path);
+                block_subtree(&mut plan, &mut blocked, path)?;
             }
             (Some(left), Some(right)) => {
                 plan_both(
@@ -244,7 +307,7 @@ pub fn build_plan_with_budget(
                     direction,
                     modify_window_ns,
                     digests,
-                    metadata_policy,
+                    policy.metadata,
                 )?;
             }
             (None, None) => unreachable!(),
@@ -265,10 +328,38 @@ pub fn build_plan_with_budget(
                     .depth()
                     .cmp(&right.path().depth())
                     .then_with(|| left.path().cmp(right.path())),
+                (Operation::DeleteEntry { .. }, Operation::DeleteEntry { .. }) => right
+                    .path()
+                    .depth()
+                    .cmp(&left.path().depth())
+                    .then_with(|| left.path().cmp(right.path())),
                 _ => left.path().cmp(right.path()),
             })
     });
     Ok(plan)
+}
+
+fn has_blocked_ancestor(blocked: &BTreeSet<RelativePath>, path: &RelativePath) -> bool {
+    let mut parent = path.parent();
+    while let Some(ancestor) = parent {
+        if blocked.contains(&ancestor) {
+            return true;
+        }
+        parent = ancestor.parent();
+    }
+    false
+}
+
+fn block_subtree(
+    plan: &mut Plan,
+    blocked: &mut BTreeSet<RelativePath>,
+    path: RelativePath,
+) -> Result<()> {
+    if !blocked.contains(&path) {
+        plan.charge(64usize.saturating_add(path.as_bytes().len()))?;
+        blocked.insert(path);
+    }
+    Ok(())
 }
 
 fn plan_one_sided(
@@ -276,12 +367,33 @@ fn plan_one_sided(
     source: Side,
     entry: &ManifestEntry,
     direction: Direction,
+    delete: bool,
+    excludes: Option<&Excludes>,
 ) -> Result<()> {
     if entry.kind == EntryKind::Unsupported {
         plan.push_warning(entry.path.clone(), "unsupported file kind skipped".into())?;
         return Ok(());
     }
     if !permitted(source, direction) {
+        if delete
+            && !entry.path.is_root()
+            && !excludes.is_some_and(|excludes| {
+                excludes.is_excluded(&entry.path, false) || excludes.is_excluded(&entry.path, true)
+            })
+        {
+            plan.push_operation(Operation::DeleteEntry {
+                target: source,
+                entry: entry.clone(),
+            })?;
+            if entry.kind == EntryKind::Directory {
+                plan.push_operation(Operation::FinalizeDirectory {
+                    target: source,
+                    entry: entry.clone(),
+                    conditional_on_delete_failure: true,
+                })?;
+            }
+            return Ok(());
+        }
         plan.skipped += 1;
         return Ok(());
     }
@@ -294,6 +406,7 @@ fn plan_one_sided(
             plan.push_operation(Operation::FinalizeDirectory {
                 target: other(source),
                 entry: entry.clone(),
+                conditional_on_delete_failure: false,
             })?;
             return Ok(());
         }
@@ -381,6 +494,7 @@ fn plan_both(
                     plan.push_operation(Operation::FinalizeDirectory {
                         target: other(source),
                         entry: entry.clone(),
+                        conditional_on_delete_failure: false,
                     })?;
                 } else {
                     plan.skipped += 1;
@@ -539,7 +653,7 @@ fn add_touched_directory_finalizers(
     let mut finalizers = BTreeSet::<(Side, RelativePath)>::new();
     let mut temporary_bytes = 0usize;
     for operation in &plan.operations {
-        if let Operation::FinalizeDirectory { target, entry } = operation {
+        if let Operation::FinalizeDirectory { target, entry, .. } = operation {
             let key = (*target, entry.path.clone());
             if !finalizers.contains(&key) {
                 temporary_bytes = plan
@@ -556,6 +670,7 @@ fn add_touched_directory_finalizers(
             | Operation::WriteSymlink { source, entry } => {
                 Some((other(*source), entry.path.clone()))
             }
+            Operation::DeleteEntry { target, entry } => Some((*target, entry.path.clone())),
             Operation::FinalizeDirectory { .. } => None,
         } && !mutations.contains(&mutation)
         {
@@ -588,6 +703,7 @@ fn add_touched_directory_finalizers(
                     additions.push(Operation::FinalizeDirectory {
                         target,
                         entry: entry.clone(),
+                        conditional_on_delete_failure: false,
                     });
                 }
             }
@@ -630,7 +746,8 @@ const fn operation_rank(operation: &Operation) -> u8 {
     match operation {
         Operation::CreateDirectory { .. } => 0,
         Operation::TransferFile { .. } | Operation::WriteSymlink { .. } => 1,
-        Operation::FinalizeDirectory { .. } => 2,
+        Operation::DeleteEntry { .. } => 2,
+        Operation::FinalizeDirectory { .. } => 3,
     }
 }
 
@@ -673,6 +790,15 @@ mod tests {
                 .into_iter()
                 .map(|entry| (entry.path.clone(), entry))
                 .collect(),
+            root_kind: crate::manifest::ManifestRootKind::Directory,
+        }
+    }
+
+    fn entry_root_manifest(entry: ManifestEntry) -> Manifest {
+        assert!(entry.path.is_root());
+        Manifest {
+            entries: BTreeMap::from([(entry.path.clone(), entry)]),
+            root_kind: crate::manifest::ManifestRootKind::Entry,
         }
     }
 
@@ -687,7 +813,10 @@ mod tests {
             Direction::InOut,
             0,
             None,
-            policy,
+            PlanningPolicy {
+                metadata: policy,
+                ..PlanningPolicy::default()
+            },
             MAX_PLAN_BYTES,
         )
         .unwrap()
@@ -716,6 +845,53 @@ mod tests {
     }
 
     #[test]
+    fn selected_file_root_transfers_without_parent_directory_operations() {
+        let local = entry_root_manifest(entry("", EntryKind::File, 2, 7));
+        let remote = Manifest::empty(crate::manifest::ManifestRootKind::Entry);
+        let plan = build_plan(&local, &remote, Direction::InOut, 0, None).unwrap();
+        assert!(matches!(
+            plan.operations.as_slice(),
+            [Operation::TransferFile {
+                source: Side::Local,
+                entry
+            }] if entry.path.is_root()
+        ));
+    }
+
+    #[test]
+    fn selected_file_delete_flag_warns_that_job_roots_are_not_deleted() {
+        let local = entry_root_manifest(entry("", EntryKind::File, 2, 7));
+        let remote = Manifest::empty(crate::manifest::ManifestRootKind::Entry);
+        let plan = build_plan_with_budget(
+            &local,
+            &remote,
+            Direction::Out,
+            0,
+            None,
+            PlanningPolicy {
+                delete: true,
+                ..PlanningPolicy::default()
+            },
+            MAX_PLAN_BYTES,
+        )
+        .unwrap();
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|(_, warning)| warning.contains("job roots are never deleted"))
+        );
+    }
+
+    #[test]
+    fn selected_file_and_directory_roots_conflict_without_descendant_operations() {
+        let local = entry_root_manifest(entry("", EntryKind::File, 2, 7));
+        let remote = manifest(vec![entry("child", EntryKind::File, 1, 1)]);
+        let plan = build_plan(&local, &remote, Direction::InOut, 0, None).unwrap();
+        assert_eq!(plan.conflicts, vec![RelativePath::root()]);
+        assert!(plan.operations.is_empty());
+    }
+
+    #[test]
     fn direction_never_reverses_newer_winner_or_deletes() {
         let local = manifest(vec![entry("x", EntryKind::File, 1, 1)]);
         let remote = manifest(vec![
@@ -725,6 +901,141 @@ mod tests {
         let plan = build_plan(&local, &remote, Direction::Out, 0, None).unwrap();
         assert!(plan.operations.is_empty());
         assert_eq!(plan.skipped, 2);
+    }
+
+    #[test]
+    fn one_way_delete_removes_only_receiver_side_entries() {
+        let local = manifest(vec![
+            entry("send", EntryKind::File, 1, 1),
+            entry("keep", EntryKind::File, 2, 1),
+        ]);
+        let remote = manifest(vec![
+            entry("remove", EntryKind::File, 1, 1),
+            entry("keep", EntryKind::File, 1, 1),
+        ]);
+        let plan = build_plan_with_budget(
+            &local,
+            &remote,
+            Direction::Out,
+            0,
+            None,
+            PlanningPolicy {
+                delete: true,
+                ..PlanningPolicy::default()
+            },
+            MAX_PLAN_BYTES,
+        )
+        .unwrap();
+        assert!(plan.operations.iter().any(|operation| {
+            matches!(operation, Operation::DeleteEntry { target: Side::Remote, entry } if entry.path.as_bytes() == b"remove")
+        }));
+        assert!(plan.operations.iter().any(|operation| {
+            matches!(operation, Operation::TransferFile { source: Side::Local, entry } if entry.path.as_bytes() == b"send")
+        }));
+        assert!(!plan.operations.iter().any(|operation| {
+            matches!(operation, Operation::DeleteEntry { entry, .. } if entry.path.as_bytes() == b"send")
+        }));
+    }
+
+    #[test]
+    fn deletes_children_before_directories_and_never_deletes_job_root() {
+        let local = manifest(Vec::new());
+        let remote = manifest(vec![
+            entry("old", EntryKind::Directory, 1, 0),
+            entry("old/child", EntryKind::File, 1, 1),
+        ]);
+        let plan = build_plan_with_budget(
+            &local,
+            &remote,
+            Direction::Out,
+            0,
+            None,
+            PlanningPolicy {
+                delete: true,
+                ..PlanningPolicy::default()
+            },
+            MAX_PLAN_BYTES,
+        )
+        .unwrap();
+        let deletes: Vec<_> = plan
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::DeleteEntry { entry, .. } => Some(entry.path.as_bytes()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deletes, [b"old/child".as_slice(), b"old".as_slice()]);
+        assert!(
+            plan.operations
+                .iter()
+                .all(|operation| !operation.path().is_root()
+                    || !matches!(operation, Operation::DeleteEntry { .. }))
+        );
+        assert!(plan.operations.iter().any(|operation| {
+            matches!(operation, Operation::FinalizeDirectory { entry, .. } if entry.path.as_bytes() == b"old")
+        }));
+    }
+
+    #[test]
+    fn sending_inventory_barrier_protects_only_its_subtree() {
+        let mut barrier = entry("unreadable", EntryKind::Unsupported, 1, 0);
+        barrier.scan_error = Some("permission denied".into());
+        let local = manifest(vec![barrier]);
+        let remote = manifest(vec![
+            entry("unreadable", EntryKind::Directory, 1, 0),
+            entry("unreadable/child", EntryKind::File, 1, 1),
+            entry("unreadable.rs", EntryKind::File, 1, 1),
+            entry("remote-only", EntryKind::File, 1, 1),
+        ]);
+        let plan = build_plan_with_budget(
+            &local,
+            &remote,
+            Direction::Out,
+            0,
+            None,
+            PlanningPolicy {
+                delete: true,
+                ..PlanningPolicy::default()
+            },
+            MAX_PLAN_BYTES,
+        )
+        .unwrap();
+        assert!(plan.operations.iter().any(|operation| {
+            matches!(operation, Operation::DeleteEntry { entry, .. } if entry.path.as_bytes() == b"remote-only")
+        }));
+        assert!(plan.operations.iter().any(|operation| {
+            matches!(operation, Operation::DeleteEntry { entry, .. } if entry.path.as_bytes() == b"unreadable.rs")
+        }));
+        assert!(plan.operations.iter().all(|operation| {
+            !matches!(operation, Operation::DeleteEntry { entry, .. } if entry.path.as_bytes().starts_with(b"unreadable/"))
+        }));
+    }
+
+    #[test]
+    fn directory_only_exclude_protects_receiver_file_from_delete() {
+        let local = manifest(Vec::new());
+        let remote = manifest(vec![entry("build", EntryKind::File, 1, 1)]);
+        let excludes = Excludes::compile(&["build/".into()]).unwrap();
+        let plan = build_plan_with_budget(
+            &local,
+            &remote,
+            Direction::Out,
+            0,
+            None,
+            PlanningPolicy {
+                delete: true,
+                excludes: Some(&excludes),
+                ..PlanningPolicy::default()
+            },
+            MAX_PLAN_BYTES,
+        )
+        .unwrap();
+        assert!(
+            plan.operations
+                .iter()
+                .all(|operation| !matches!(operation, Operation::DeleteEntry { .. }))
+        );
     }
 
     #[test]
@@ -789,10 +1100,10 @@ mod tests {
         let remote = manifest(vec![entry("remote", EntryKind::File, 1, 1)]);
         let plan = build_plan(&local, &remote, Direction::InOut, 0, None).unwrap();
         assert!(plan.operations.iter().any(|operation| {
-            matches!(operation, Operation::FinalizeDirectory { target: Side::Local, entry } if entry.path.is_root())
+            matches!(operation, Operation::FinalizeDirectory { target: Side::Local, entry, .. } if entry.path.is_root())
         }));
         assert!(plan.operations.iter().any(|operation| {
-            matches!(operation, Operation::FinalizeDirectory { target: Side::Remote, entry } if entry.path.is_root())
+            matches!(operation, Operation::FinalizeDirectory { target: Side::Remote, entry, .. } if entry.path.is_root())
         }));
     }
 

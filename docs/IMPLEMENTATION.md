@@ -66,6 +66,7 @@ tests/
 
 - [x] Implement the grouped CLI grammar, direction inheritance, SSH shell-word
       splitting, attached progress modes, modify-window/clock policy, ownership
+      and `-a`/`--archive` shorthand, one-way per-path `--delete`
       flags, and every option in DESIGN section 2 including internal `--agent`;
       cover `--dest` default/relative/duplicate behavior, `--exclude`, `--dir`,
       `--`, leading-dash server rejection, overlap validation, help/version and
@@ -82,13 +83,18 @@ tests/
       regular files, symlinks, metadata, non-UTF-8 names, unsupported kinds, and
       exclusion pruning; enforce the entry-count and binding manifest-memory caps
       with structured limit errors. The reserved `.xsync.tmp.` prefix is always
-      pruned, including stale debris, before user exclusions. Walk iteratively
+      pruned, including stale debris, before user exclusions; visible
+      `.xsync.recovery.*` artifacts become protected inventory barriers. Walk iteratively
       and enforce the depth cap so deep trees return a structured path error
       instead of stack overflow or file-descriptor exhaustion.
-- [x] Implement job-root resolution/opening as a recorded directory capability,
-      reject symlinks below it, and acquire/release a nonblocking advisory root
-      lock using the selected safe capability/`rustix` APIs; cover busy and
-      escaped-root cases.
+- [x] Implement job-root resolution/opening as an explicit directory-root or
+      selected-entry capability. Directory roots reject symlinks below them;
+      entry roots open the parent capability, retain the exact basename, target
+      only logical `.`, and never expose siblings. Directory roots acquire a
+      nonblocking exclusive advisory lock; entry roots acquire a shared parent
+      lock so unrelated entry jobs coexist but a directory-root job on that
+      parent is excluded. Per-target fingerprint and atomic-commit checks arbitrate
+      same-entry writers. Cover busy, concurrent-target, and escaped-root cases.
 - [x] Implement content digesting over a byte source plus source/destination
       fingerprint capture and revalidation (device, inode, kind, size, mtime).
 - [x] Implement the full deterministic planning matrix, conflict/blocking rules,
@@ -98,6 +104,10 @@ tests/
       and digest resolution produces the final plan. Test equal/different digests
       and the checksum-off single-pass path, modify-window boundaries, and
       explicit unsupported-kind skip/report behavior.
+- [x] Implement one-way receiver-only deletion planning, deepest-first delete
+      order after transfers, job-root protection, subtree barrier protection,
+      runtime suppression after earlier errors, and conditional metadata
+      finalization for directories that survive failed deletion.
 
 ### D. Delta engine
 
@@ -128,6 +138,15 @@ tests/
 - [x] Implement chunked manifest and delta/signature exchanges with negotiated
       resource limits, plus bounded chunked `DigestRequest`/`DigestResponse` for
       checksum ambiguity, with state-machine tests.
+- [x] Negotiate `FEATURE_FILE_ROOT` and the path-root intent/actual-kind job
+      messages without changing legacy directory message encodings. Validate
+      directory and selected-entry manifest shapes independently, fail file jobs
+      against older agents before beginning work, and turn existing root-kind
+      mismatches into structural conflicts.
+- [x] Negotiate `FEATURE_DELETE`, omit false delete fields for old path-root
+      endpoints, bind delete authorization to the active job, validate exact
+      receiver-manifest membership, and revalidate sender absence with the
+      bounded `ValidateAbsent` request.
 
 ### F. Safe receiver filesystem operations
 
@@ -142,14 +161,20 @@ tests/
       write; assert in-progress temporary files are exclusively mode `0600`.
       Compare the reconstruction's running length/digest to the trailer before
       any commit.
-- [x] Implement missing job-root policy: create only the root at provisional
-      `0700` when direction permits, report `RootParentMissing`, fail a missing
-      read-only-side root, and represent a writable-side missing root as a virtual
-      empty manifest in dry-run without opening/locking/creating it. Finalize the
-      empty-path root entry with explicit tests.
+- [x] Implement missing job-root policy: create only a directory root at
+      provisional `0700` when direction permits, report `RootParentMissing`, and
+      fail a missing read-only-side root. A selected-entry receiver opens and
+      shared-locks its existing parent capability but does not create or `mkdir`
+      the target until atomic commit, including dry-run. `Auto` adopts an existing remote type and
+      retains legacy directory behavior when both sides are absent. Finalize
+      empty-path directory roots with explicit tests.
 - [x] Implement file/directory modes, mtimes, best-effort numeric ownership,
       special-bit masking, opt-in name/numeric ownership, reverse-depth
       directory/root finalization, and warning reporting.
+- [x] Implement fingerprint-checked deletion by same-parent recovery rename,
+      post-rename identity verification, non-recursive file/symlink unlink or
+      directory emptiness preflight/`rmdir`, and `NOREPLACE` rollback. Protect
+      recovery artifacts, excluded descendants, concurrent replacements, and all job roots.
 - [x] Test symlink ancestors, replacement failures, interruption cleanup,
       metadata, and basis/source-change detection.
 
@@ -176,7 +201,7 @@ tests/
       ambiguous set; prove no digest request is sent when checksum mode is off.
 - [x] Implement remote-to-local whole/delta files and the same receiver safety.
 - [x] Wire bidirectional plans, conflicts, recoverable entry failures, dry-run,
-      sequential multi-directory reuse, and final exit status.
+      sequential multi-path reuse, and final exit status.
 - [x] Implement SIGINT/EOF cancellation: drain or abort between streams,
       use a flag-only handler and watchdog to terminate an in-flight blocked
       transport, remove controller temporaries, rely on agent stdin EOF for its
@@ -194,13 +219,20 @@ tests/
 ### I. End-to-end hardening
 
 - [x] Prove through the fake SSH harness that one agent session handles multiple
-      directory jobs without reconnecting.
+      path jobs without reconnecting.
 - [x] Add end-to-end tests for all modes, newer-wins, one-sided copy/no deletion,
       conflict safety, excludes, metadata, symlinks, delta reuse, non-UTF-8 paths,
       missing-root creation/read-only/parent errors, clock-skew refusal/override,
       incompatible versions, corrupt banners, transport death, interruption
       (exit 130 and no temporary files), dry-run, and `--checksum` both detecting
       same-size/same-mtime divergence and confirming identical content as no-op.
+- [x] Add one-way delete end-to-end coverage for inbound/outbound reconciliation,
+      dry-run, excludes, nonempty-directory retention, recovery barriers, and
+      required-feature refusal before mutation. Inject a sender appearance
+      after inventory to prove absence revalidation and later-delete suppression.
+- [x] Add selected-file root end-to-end coverage for exact-path creation,
+      `--dest` rename semantics, inbound creation, newer-wins updates, dry-run,
+      and file/directory root conflicts without mutation.
 - [x] Assert the full exit matrix end to end: 0 including warnings-only, 1 for
       conflict/recoverable entry failure, 2 for usage, and 3 for handshake,
       corrupt-banner, and transport failures.

@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    ffi::OsStr,
     fs,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::Path,
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Error, Result,
     exclude::Excludes,
-    path::{MAX_DEPTH, RelativePath, TEMP_PREFIX},
+    path::{MAX_DEPTH, RECOVERY_PREFIX, RelativePath, TEMP_PREFIX},
 };
 
 pub const MAX_ENTRIES: usize = 1_000_000;
@@ -58,6 +59,13 @@ pub enum EntryKind {
     Directory,
     Symlink,
     Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ManifestRootKind {
+    #[default]
+    Directory,
+    Entry,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -141,9 +149,19 @@ impl ManifestEntry {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub entries: BTreeMap<RelativePath, ManifestEntry>,
+    #[serde(skip)]
+    pub root_kind: ManifestRootKind,
 }
 
 impl Manifest {
+    #[must_use]
+    pub fn empty(root_kind: ManifestRootKind) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            root_kind,
+        }
+    }
+
     #[must_use]
     pub fn get(&self, path: &RelativePath) -> Option<&ManifestEntry> {
         self.entries.get(path)
@@ -161,8 +179,23 @@ impl Manifest {
             return Err(Error::Protocol("manifest entry limit exceeded".into()));
         }
         let root = RelativePath::root();
-        if self.entries.get(&root).map(|entry| entry.kind) != Some(EntryKind::Directory) {
-            return Err(Error::Protocol("manifest root is not a directory".into()));
+        let root_entry_kind = self
+            .entries
+            .get(&root)
+            .map(|entry| entry.kind)
+            .ok_or_else(|| Error::Protocol("manifest has no root entry".into()))?;
+        match self.root_kind {
+            ManifestRootKind::Directory if root_entry_kind != EntryKind::Directory => {
+                return Err(Error::Protocol("manifest root is not a directory".into()));
+            }
+            ManifestRootKind::Entry
+                if root_entry_kind == EntryKind::Directory || self.entries.len() != 1 =>
+            {
+                return Err(Error::Protocol(
+                    "entry-root manifest is not exactly one non-directory entry".into(),
+                ));
+            }
+            ManifestRootKind::Directory | ManifestRootKind::Entry => {}
         }
         let mut bytes = 0usize;
         for (path, entry) in &self.entries {
@@ -214,6 +247,82 @@ pub fn scan_dir(root_dir: &Dir, root: &Path, excludes: &Excludes) -> Result<Mani
         crate::path::MAX_RELATIVE_PATH_BYTES,
         MAX_DEPTH,
     )
+}
+
+pub fn scan_entry_with_limits(
+    parent_dir: &Dir,
+    root: &Path,
+    name: &OsStr,
+    expected: Option<Fingerprint>,
+    max_entries: usize,
+    max_bytes: usize,
+    max_path: usize,
+) -> Result<Manifest> {
+    let metadata = match parent_dir.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && expected.is_none() => {
+            return Ok(Manifest::empty(ManifestRootKind::Entry));
+        }
+        Err(error) => return Err(Error::io(Some(root.to_path_buf()), error)),
+    };
+    let initial = entry_from_cap_metadata(RelativePath::root(), &metadata, Vec::new());
+    if expected != Some(initial.fingerprint) {
+        return Err(Error::entry(
+            "root-changed",
+            Some(root.to_path_buf()),
+            "selected job root changed before inventory",
+        ));
+    }
+    if initial.kind == EntryKind::Directory {
+        return Err(Error::Io {
+            path: Some(root.to_path_buf()),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "selected entry root is a directory",
+            ),
+        });
+    }
+    let target = if initial.kind == EntryKind::Symlink {
+        let target = parent_dir
+            .read_link_contents(name)
+            .map_err(|error| Error::io(Some(root.to_path_buf()), error))?
+            .into_os_string()
+            .into_vec();
+        if target.len() > max_path {
+            return Err(Error::entry(
+                "limit",
+                Some(root.to_path_buf()),
+                "symlink target exceeds negotiated path/frame limit",
+            ));
+        }
+        let after = parent_dir
+            .symlink_metadata(name)
+            .map_err(|error| Error::io(Some(root.to_path_buf()), error))?;
+        if cap_fingerprint_fields(&after) != cap_fingerprint_fields(&metadata) {
+            return Err(Error::entry(
+                "root-changed",
+                Some(root.to_path_buf()),
+                "selected symlink changed during inventory",
+            ));
+        }
+        target
+    } else {
+        Vec::new()
+    };
+    let entry = entry_from_cap_metadata(RelativePath::root(), &metadata, target);
+    if max_entries == 0 || estimate_entry_bytes(&entry) > max_bytes {
+        return Err(Error::entry(
+            "limit",
+            Some(root.to_path_buf()),
+            "manifest resource limit exceeded at selected entry root",
+        ));
+    }
+    let manifest = Manifest {
+        entries: BTreeMap::from([(RelativePath::root(), entry)]),
+        root_kind: ManifestRootKind::Entry,
+    };
+    manifest.validate(false)?;
+    Ok(manifest)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -327,6 +436,22 @@ pub fn scan_dir_with_limits(
             ));
         }
         let display_path = root.join(child_relative.to_path_buf());
+        if name.as_bytes().starts_with(RECOVERY_PREFIX) {
+            let entry = scan_error_entry(
+                child_relative.clone(),
+                "xsync recovery artifact is protected; inspect and resolve it manually".into(),
+                max_path,
+            );
+            insert_scanned_entry(
+                &mut entries,
+                &mut memory_used,
+                max_entries,
+                max_bytes,
+                entry,
+                &display_path,
+            )?;
+            continue;
+        }
         let metadata = match current.dir.symlink_metadata(&name) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -444,7 +569,10 @@ pub fn scan_dir_with_limits(
             stack.push(frame);
         }
     }
-    let manifest = Manifest { entries };
+    let manifest = Manifest {
+        entries,
+        root_kind: ManifestRootKind::Directory,
+    };
     manifest.validate(false)?;
     Ok(manifest)
 }
@@ -707,6 +835,25 @@ mod tests {
     }
 
     #[test]
+    fn recovery_artifacts_are_protected_inventory_barriers() {
+        let root = tempdir().unwrap();
+        let name = ".xsync.recovery.interrupted";
+        fs::write(root.path().join(name), b"original data").unwrap();
+        let manifest = scan(root.path(), &Excludes::default()).unwrap();
+        let recovery = manifest
+            .get(&RelativePath::new(name.as_bytes().to_vec()).unwrap())
+            .unwrap();
+        assert_eq!(recovery.kind, EntryKind::Unsupported);
+        assert!(
+            recovery
+                .scan_error
+                .as_deref()
+                .unwrap()
+                .contains("protected")
+        );
+    }
+
+    #[test]
     fn directory_replacement_becomes_a_barrier_and_other_entries_continue() {
         let root = tempdir().unwrap();
         let path = root.path().join("directory");
@@ -738,6 +885,40 @@ mod tests {
                 .entries
                 .contains_key(&RelativePath::new(vec![0xff]).unwrap())
         );
+    }
+
+    #[test]
+    fn scans_one_selected_entry_at_logical_root_and_validates_shape() {
+        let parent = tempdir().unwrap();
+        let selected = parent.path().join("selected");
+        fs::write(&selected, b"data").unwrap();
+        fs::write(parent.path().join("sibling"), b"must not be inventoried").unwrap();
+        let dir = Dir::open_ambient_dir(parent.path(), ambient_authority()).unwrap();
+        let metadata = dir.symlink_metadata("selected").unwrap();
+        let expected =
+            entry_from_cap_metadata(RelativePath::root(), &metadata, Vec::new()).fingerprint;
+        let manifest = scan_entry_with_limits(
+            &dir,
+            &selected,
+            OsStr::new("selected"),
+            Some(expected),
+            1,
+            MAX_MANIFEST_BYTES,
+            crate::path::MAX_RELATIVE_PATH_BYTES,
+        )
+        .unwrap();
+        assert_eq!(manifest.root_kind, ManifestRootKind::Entry);
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(
+            manifest.entries[&RelativePath::root()].kind,
+            EntryKind::File
+        );
+
+        let mut malformed = manifest;
+        let mut child = malformed.entries[&RelativePath::root()].clone();
+        child.path = RelativePath::new(b"child".to_vec()).unwrap();
+        malformed.entries.insert(child.path.clone(), child);
+        assert!(malformed.validate(false).is_err());
     }
 
     #[test]
